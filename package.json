@@ -1,0 +1,24 @@
+{
+  "name": "line-context-relay",
+  "version": "0.1.0",
+  "description": "Local-first, read-only LINE conversation advice for ChatGPT/Codex on macOS.",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LEO0047/line-chat-advisor-mcp-ai-assistant.git"
+  },
+  "type": "module",
+  "scripts": {
+    "start": "node src/line-readonly-mcp/server.mjs",
+    "test": "node --test tests/*.test.mjs && .venv/bin/python3 -m unittest discover -s tests -p 'test_*.py'",
+    "doctor": "scripts/doctor"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "3.25.76"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

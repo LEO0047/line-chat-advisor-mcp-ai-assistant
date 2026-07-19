@@ -1,0 +1,50 @@
+# Dependencies and build products
+node_modules/
+.venv/
+dist/
+coverage/
+__pycache__/
+*.py[cod]
+
+# Upstream working copies are pinned in VENDOR_LOCK.md, not vendored into Git.
+vendor/
+
+# Private LINE material and local state
+contacts/**
+data/**
+runtime/**
+*.edb
+*.edb-wal
+*.edb-shm
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.png
+*.jpg
+*.jpeg
+*.heic
+*.ocr.*
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+config.local.*
+.npmrc
+.pypirc
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+*.mobileprovision
+candidates.txt
+scan-status.json
+
+# macOS/editor noise
+.DS_Store
+.idea/
+.vscode/

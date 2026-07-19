@@ -1,0 +1,37 @@
+#!/bin/zsh
+set -euo pipefail
+
+project_root="${0:A:h:h}"
+capture_root="$project_root/runtime/key-capture"
+copy_path="$capture_root/LINEcopy.app"
+entitlements="$project_root/src/key-capture/line-copy.entitlements.plist"
+helper="$project_root/runtime/bin/keychain-store"
+
+if [[ -e "$copy_path" ]]; then
+  print -u2 'A previous LINE copy exists. Run scripts/cleanup-key-capture first.'
+  exit 1
+fi
+if [[ ! -d /Applications/LINE.app ]]; then
+  print -u2 'Official /Applications/LINE.app is unavailable.'
+  exit 1
+fi
+
+mkdir -p "$capture_root" "$project_root/runtime/bin"
+chmod 700 "$capture_root"
+/usr/bin/swiftc -O -framework Security "$project_root/src/key-capture/KeychainStore.swift" -o "$helper"
+chmod 700 "$helper"
+/usr/bin/ditto /Applications/LINE.app "$copy_path"
+
+official_hash=$(/usr/bin/shasum -a 256 /Applications/LINE.app/Contents/MacOS/LINE | /usr/bin/awk '{print $1}')
+copy_hash=$(/usr/bin/shasum -a 256 "$copy_path/Contents/MacOS/LINE" | /usr/bin/awk '{print $1}')
+if [[ "$official_hash" != "$copy_hash" ]]; then
+  print -u2 'LINE executable content changed while copying; refusing to sign or launch.'
+  exit 1
+fi
+
+/usr/bin/xattr -cr "$copy_path"
+/usr/bin/codesign --force --sign - --deep --entitlements "$entitlements" "$copy_path"
+/usr/bin/codesign --verify --deep --strict "$copy_path"
+
+print '{"ok":true,"copyPrepared":true,"officialAppModified":false,"sipChangeRequired":false,"next":"Log in to the visible LINE copy, then run scripts/capture-key."}'
+/usr/bin/open -n "$copy_path"

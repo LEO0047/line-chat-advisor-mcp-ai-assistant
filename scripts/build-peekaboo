@@ -1,0 +1,36 @@
+#!/bin/zsh
+set -euo pipefail
+
+project_root=${0:A:h:h}
+checkout_root="$project_root/vendor/Peekaboo"
+package_root="$checkout_root/Apps/CLI"
+scratch_root="$project_root/runtime/peekaboo-cli-build"
+install_root="$project_root/runtime/bin"
+
+if [[ ! -d "$checkout_root/.git" ]]; then
+  print -u2 -- 'Pinned Peekaboo checkout is missing. Run scripts/bootstrap-vendors first.'
+  exit 1
+fi
+
+expected=ed641fb44acbc06217399787b5dae7de0cb6cb84
+actual=$(/usr/bin/git -C "$checkout_root" rev-parse HEAD)
+if [[ "$actual" != "$expected" ]]; then
+  print -u2 -- "Peekaboo is at $actual, expected $expected; refusing to build an unreviewed revision."
+  exit 1
+fi
+
+mkdir -p "$scratch_root" "$install_root"
+/usr/bin/swift build \
+  --package-path "$package_root" \
+  --scratch-path "$scratch_root" \
+  --configuration release \
+  --product peekaboo
+bin_root=$(/usr/bin/swift build \
+  --package-path "$package_root" \
+  --scratch-path "$scratch_root" \
+  --configuration release \
+  --show-bin-path)
+/usr/bin/ditto "$bin_root/peekaboo" "$install_root/peekaboo"
+chmod 700 "$install_root/peekaboo"
+
+"$install_root/peekaboo" --version

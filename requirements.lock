@@ -1,0 +1,4 @@
+# cp314 macOS arm64 wheel inspected on 2026-07-19. It contains the APSW Python
+# package plus two native extension binaries and has no install-time script.
+apsw-sqlite3mc==3.51.0.0 \
+    --hash=sha256:2b44393be2508c9e0e620fce8092ea99d97c064b8fd878ace36c8df9dd612cc7

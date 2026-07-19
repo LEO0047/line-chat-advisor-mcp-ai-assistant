@@ -1,0 +1,35 @@
+#!/bin/zsh
+set -euo pipefail
+
+project_root=${0:A:h:h}
+vendor_root="$project_root/vendor"
+mkdir -p "$vendor_root"
+
+clone_pinned() {
+  local name=$1
+  local url=$2
+  local commit=$3
+  local destination="$vendor_root/$name"
+
+  if [[ -e "$destination" && ! -d "$destination/.git" ]]; then
+    print -u2 -- "$destination exists but is not a Git checkout; refusing to overwrite it."
+    return 1
+  fi
+  if [[ ! -d "$destination/.git" ]]; then
+    /usr/bin/git clone --no-checkout "$url" "$destination"
+    /usr/bin/git -C "$destination" checkout --detach "$commit"
+  fi
+
+  local actual=$(/usr/bin/git -C "$destination" rev-parse HEAD)
+  if [[ "$actual" != "$commit" ]]; then
+    print -u2 -- "$destination is at $actual, expected $commit; refusing to reset user changes."
+    return 1
+  fi
+  print -r -- "$name $actual"
+}
+
+clone_pinned line-cua-mcp https://github.com/kenghuaku/line-cua-mcp.git f83d70fcae9a6daa350909053017af9f6794d59c
+clone_pinned local-chat-memory https://github.com/cyakkunnlove/local-chat-memory.git 81204951a7c4ff0147417d8a149c3cbddd3ce3d3
+clone_pinned Peekaboo https://github.com/openclaw/Peekaboo.git ed641fb44acbc06217399787b5dae7de0cb6cb84
+
+print '{"ok":true,"vendorsPinned":true,"vendorCodeExecuted":false}'

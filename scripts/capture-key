@@ -1,0 +1,43 @@
+#!/bin/zsh
+set -euo pipefail
+
+project_root="${0:A:h:h}"
+capture_root="$project_root/runtime/key-capture"
+copy_path="$capture_root/LINEcopy.app"
+candidates="$capture_root/candidates.txt"
+scan_status="$capture_root/scan-status.json"
+lldb_log="$capture_root/lldb.log"
+scanner="$project_root/src/key-capture/lldb_scan.py"
+validator="$project_root/src/key-capture/validate_candidates.py"
+
+if [[ ! -d "$copy_path" ]]; then
+  print -u2 'Prepared LINE copy is unavailable.'
+  exit 1
+fi
+
+copy_pid=$(/bin/ps -axo pid=,comm= | /usr/bin/awk -v p="$copy_path/Contents/MacOS/LINE" '$2 == p {print $1}')
+pid_count=$(print -r -- "$copy_pid" | /usr/bin/awk 'NF {count++} END {print count+0}')
+if [[ "$pid_count" -ne 1 ]]; then
+  print -u2 "Expected one logged-in LINE copy process; found $pid_count."
+  exit 1
+fi
+
+chmod 700 "$capture_root"
+umask 077
+export LINE_KEY_CANDIDATES_PATH="$candidates"
+export LINE_KEY_SCAN_STATUS_PATH="$scan_status"
+/usr/bin/lldb --batch --attach-pid "$copy_pid" \
+  -o "command script import $scanner" \
+  -o line_scan \
+  -o detach >"$lldb_log" 2>&1
+
+set +e
+validation=$("$project_root/.venv/bin/python3" "$validator" "$candidates")
+validation_status=$?
+set -e
+/bin/rm -f "$lldb_log" "$scan_status"
+print -r -- "$validation"
+if [[ "$validation_status" -ne 0 ]]; then
+  exit "$validation_status"
+fi
+"$project_root/scripts/cleanup-key-capture"

@@ -1,0 +1,13 @@
+#!/bin/zsh
+set -euo pipefail
+
+project_root=${0:A:h:h}
+python_bin="$project_root/.venv/bin/python3"
+bridge="$project_root/src/line-readonly-mcp/bridge.py"
+
+if [[ ! -x "$python_bin" ]]; then
+  print -r -- '{"ok":false,"error":"venv_missing","detail":"Run scripts/bootstrap first."}'
+  exit 1
+fi
+
+"$python_bin" "$bridge" '{"operation":"line_health","args":{}}' | /usr/bin/python3 -m json.tool

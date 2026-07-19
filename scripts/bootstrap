@@ -1,0 +1,15 @@
+#!/bin/zsh
+set -euo pipefail
+
+project_root=${0:A:h:h}
+cd "$project_root"
+
+"$project_root/scripts/bootstrap-vendors"
+
+if [[ ! -d .venv ]]; then
+  /opt/homebrew/bin/python3 -m venv .venv
+fi
+
+.venv/bin/python3 -m pip install --disable-pip-version-check --require-hashes -r requirements.lock
+npm ci --ignore-scripts --no-audit --no-fund
+npm run test

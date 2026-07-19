@@ -1,0 +1,22 @@
+#!/bin/zsh
+set -euo pipefail
+
+project_root="${0:A:h:h}"
+capture_root="$project_root/runtime/key-capture"
+copy_path="$capture_root/LINEcopy.app"
+expected="$project_root/runtime/key-capture/LINEcopy.app"
+
+if [[ "$copy_path" != "$expected" || "$copy_path" == "/Applications/LINE.app" ]]; then
+  print -u2 'Unsafe cleanup target; refusing.'
+  exit 1
+fi
+
+if [[ -d "$copy_path" ]]; then
+  copy_pids=$(/bin/ps -axo pid=,comm= | /usr/bin/awk -v p="$copy_path/Contents/" 'index($2,p) == 1 {print $1}')
+  if [[ -n "$copy_pids" ]]; then
+    print -r -- "$copy_pids" | /usr/bin/xargs /bin/kill
+  fi
+  /bin/rm -rf "$copy_path"
+fi
+/bin/rm -f "$capture_root/candidates.txt" "$capture_root/scan-status.json" "$capture_root/lldb.log"
+print '{"ok":true,"lineCopyRemoved":true,"captureArtifactsRemoved":true,"officialAppModified":false}'
