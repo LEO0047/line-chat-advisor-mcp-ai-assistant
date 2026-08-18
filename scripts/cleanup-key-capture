@@ -12,7 +12,7 @@ if [[ "$copy_path" != "$expected" || "$copy_path" == "/Applications/LINE.app" ]]
 fi
 
 if [[ -d "$copy_path" ]]; then
-  copy_pids=$(/bin/ps -axo pid=,comm= | /usr/bin/awk -v p="$copy_path/Contents/" 'index($2,p) == 1 {print $1}')
+  copy_pids=$(/bin/ps -axo pid=,comm= | /usr/bin/awk -v p="${copy_path:A}/Contents/" 'index($2,p) == 1 {print $1}')
   if [[ -n "$copy_pids" ]]; then
     print -r -- "$copy_pids" | /usr/bin/xargs /bin/kill
   fi

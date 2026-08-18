@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
@@ -68,7 +69,7 @@ test("read_history exposes bounded timestamp and message ID cursor pagination", 
 test("real stdio MCP handshake lists the exact allow-list and calls line_status", async () => {
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [new URL("../src/line-readonly-mcp/server.mjs", import.meta.url).pathname],
+    args: [fileURLToPath(new URL("../src/line-readonly-mcp/server.mjs", import.meta.url))],
     stderr: "pipe",
   });
   const client = new Client({ name: "line-readonly-test", version: "0.1.0" });
