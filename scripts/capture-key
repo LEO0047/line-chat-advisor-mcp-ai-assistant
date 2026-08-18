@@ -15,7 +15,8 @@ if [[ ! -d "$copy_path" ]]; then
   exit 1
 fi
 
-copy_pid=$(/bin/ps -axo pid=,comm= | /usr/bin/awk -v p="$copy_path/Contents/MacOS/LINE" '$2 == p {print $1}')
+copy_main="${copy_path:A}/Contents/MacOS/LINE"
+copy_pid=$(/bin/ps -axo pid=,comm= | /usr/bin/awk -v p="$copy_main" '$2 == p {print $1}')
 pid_count=$(print -r -- "$copy_pid" | /usr/bin/awk 'NF {count++} END {print count+0}')
 if [[ "$pid_count" -ne 1 ]]; then
   print -u2 "Expected one logged-in LINE copy process; found $pid_count."
@@ -27,7 +28,7 @@ umask 077
 export LINE_KEY_CANDIDATES_PATH="$candidates"
 export LINE_KEY_SCAN_STATUS_PATH="$scan_status"
 /usr/bin/lldb --batch --attach-pid "$copy_pid" \
-  -o "command script import $scanner" \
+  -o "command script import \"$scanner\"" \
   -o line_scan \
   -o detach >"$lldb_log" 2>&1
 
