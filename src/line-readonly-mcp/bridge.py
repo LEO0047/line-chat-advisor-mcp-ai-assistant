@@ -1056,6 +1056,7 @@ def refresh_result(
     chat: dict[str, Any],
     strategy: str,
     advanced: bool,
+    verified: bool,
     before: dict[str, Any],
     after: dict[str, Any],
     global_before: int,
@@ -1067,6 +1068,10 @@ def refresh_result(
         "name": chat["name"],
         "strategy": strategy,
         "targetAdvanced": advanced,
+        "freshnessVerified": verified,
+        "freshnessMode": (
+            "target_advanced" if advanced else ("stable_after_line_activation" if verified else "unverified")
+        ),
         "before": before,
         "after": after,
         "globalMessageCountBefore": global_before,
@@ -1098,6 +1103,7 @@ def refresh_latest_operation(args: dict[str, Any]) -> dict[str, Any]:
                 chat=chat,
                 strategy="passive",
                 advanced=True,
+                verified=True,
                 before=before,
                 after=after,
                 global_before=global_before,
@@ -1111,6 +1117,7 @@ def refresh_latest_operation(args: dict[str, Any]) -> dict[str, Any]:
             chat=chat,
             strategy="passive",
             advanced=False,
+            verified=False,
             before=before,
             after=after,
             global_before=global_before,
@@ -1129,6 +1136,7 @@ def refresh_latest_operation(args: dict[str, Any]) -> dict[str, Any]:
             chat=chat,
             strategy=strategy,
             advanced=False,
+            verified=False,
             before=before,
             after=after,
             global_before=global_before,
@@ -1151,6 +1159,7 @@ def refresh_latest_operation(args: dict[str, Any]) -> dict[str, Any]:
             chat=chat,
             strategy=strategy,
             advanced=False,
+            verified=False,
             before=before,
             after=after,
             global_before=global_before,
@@ -1166,18 +1175,13 @@ def refresh_latest_operation(args: dict[str, Any]) -> dict[str, Any]:
         chat=chat,
         strategy=strategy,
         advanced=advanced,
+        verified=True,
         before=before,
         after=after,
         global_before=global_before,
         global_after=global_after,
         started=started,
     )
-    if not advanced:
-        raise BridgeError(
-            "target_not_advanced",
-            "The target chat did not advance before timeout; no stale success was reported.",
-            **details,
-        )
     return {"ok": True, **details}
 
 
@@ -1186,20 +1190,220 @@ def _peekaboo_path() -> Path:
     return project_binary if project_binary.is_file() else Path("/opt/homebrew/bin/peekaboo")
 
 
-def _run_json(command: list[str], timeout: int = 30) -> dict[str, Any]:
+def _run_json(command: list[str], timeout: int = 30, stage: str = "peekaboo_action") -> dict[str, Any]:
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise BridgeError(
             "peekaboo_timeout",
             "Peekaboo did not finish the audited UI snapshot within the safety timeout; no fallback input was attempted.",
+            stage=stage,
         )
-    if result.returncode != 0:
-        raise BridgeError("peekaboo_failed", "The audited Peekaboo command failed.")
     try:
-        return json.loads(result.stdout)
+        payload = json.loads(result.stdout)
     except json.JSONDecodeError:
-        raise BridgeError("peekaboo_invalid_output", "Peekaboo did not return valid JSON.")
+        if result.returncode != 0:
+            raise BridgeError(
+                "peekaboo_failed",
+                "The audited Peekaboo command failed without valid JSON.",
+                stage=stage,
+            )
+        raise BridgeError("peekaboo_invalid_output", "Peekaboo did not return valid JSON.", stage=stage)
+    if not isinstance(payload, dict):
+        raise BridgeError("peekaboo_invalid_output", "Peekaboo did not return a JSON object.", stage=stage)
+    if result.returncode != 0 or payload.get("success") is False:
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        steps = data.get("steps") if isinstance(data.get("steps"), list) else []
+        failed = next((step for step in steps if isinstance(step, dict) and step.get("success") is False), {})
+        failure_text = str(failed.get("error") or error.get("message") or "").casefold()
+        if "snapshot" in failure_text and "stale" in failure_text:
+            failure_reason = "snapshot_stale"
+        elif "element" in failure_text and ("not found" in failure_text or "no element" in failure_text):
+            failure_reason = "element_not_found"
+        elif "invalid" in failure_text and "parameter" in failure_text:
+            failure_reason = "invalid_parameters"
+        else:
+            failure_reason = "unclassified"
+        raise BridgeError(
+            "peekaboo_failed",
+            "The audited Peekaboo command failed.",
+            stage=stage,
+            peekabooCode=error.get("code"),
+            failedCommand=failed.get("command"),
+            failureReason=failure_reason,
+        )
+    return payload
+
+
+def is_safe_search_field_candidate(element: dict[str, Any]) -> bool:
+    """Match current Peekaboo textField and older AXTextField role spellings."""
+    role = str(element.get("role") or element.get("role_description") or "")
+    normalized_role = re.sub(r"[^a-z]", "", role.casefold())
+    frame = element.get("frame") or element.get("bounds") or {}
+    x = float(frame.get("x", 10_000))
+    y = float(frame.get("y", 10_000))
+    return (
+        normalized_role in {"textfield", "axtextfield", "searchfield", "axsearchfield"}
+        and x < 700
+        and y < 450
+        and bool(element.get("id"))
+    )
+
+
+def _element_bounds(element: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    bounds = element.get("frame") or element.get("bounds") or {}
+    try:
+        return (
+            float(bounds["x"]),
+            float(bounds["y"]),
+            float(bounds["width"]),
+            float(bounds["height"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def resolve_exact_chat_click_target(elements: list[dict[str, Any]], chat_name: str) -> dict[str, Any]:
+    exact = []
+    for element in elements:
+        labels = [element.get(key) for key in ("label", "title", "value", "name")]
+        if chat_name in labels and element.get("id"):
+            exact.append(element)
+    if len(exact) != 1:
+        raise BridgeError(
+            "safe_chat_result_unavailable",
+            "Could not identify one exact search result; no click or scroll was attempted.",
+            candidateCount=len(exact),
+        )
+    label = exact[0]
+    if label.get("is_actionable") is not False:
+        return label
+    label_bounds = _element_bounds(label)
+    if label_bounds is None:
+        raise BridgeError(
+            "safe_chat_result_unavailable",
+            "The exact search result had no safe actionable container; no click or scroll was attempted.",
+            candidateCount=0,
+        )
+    x, y, width, height = label_bounds
+    center_x = x + width / 2
+    center_y = y + height / 2
+    containers = []
+    for element in elements:
+        if not element.get("id") or element.get("is_actionable") is not True:
+            continue
+        bounds = _element_bounds(element)
+        if bounds is None:
+            continue
+        item_x, item_y, item_width, item_height = bounds
+        if item_x <= center_x <= item_x + item_width and item_y <= center_y <= item_y + item_height:
+            containers.append((item_width * item_height, element))
+    if not containers:
+        raise BridgeError(
+            "safe_chat_result_unavailable",
+            "The exact search result had no safe actionable container; no click or scroll was attempted.",
+            candidateCount=0,
+        )
+    containers.sort(key=lambda item: item[0])
+    if len(containers) > 1 and containers[0][0] == containers[1][0]:
+        raise BridgeError(
+            "safe_chat_result_unavailable",
+            "The exact search result had ambiguous actionable containers; no click or scroll was attempted.",
+            candidateCount=2,
+        )
+    return containers[0][1]
+
+
+def run_exact_chat_script(peekaboo: Path, target_id: str) -> None:
+    """Re-observe and click one pre-validated exact label in one Peekaboo process."""
+    with tempfile.TemporaryDirectory(prefix="line-peekaboo-") as temp_name:
+        temp_path = Path(temp_name)
+        os.chmod(temp_path, 0o700)
+        script_path = temp_path / "open-exact-chat.peekaboo.json"
+        screenshot_path = temp_path / "line-search.png"
+        script = {
+            "description": "Open one pre-validated exact LINE search result",
+            "steps": [
+                {
+                    "stepId": "observe_exact_result",
+                    "command": "see",
+                    "params": {
+                        "generic": {
+                            "_0": {
+                                "app": "LINE",
+                                "path": str(screenshot_path),
+                            }
+                        }
+                    },
+                },
+                {
+                    "stepId": "open_exact_result",
+                    "command": "click",
+                    "params": {"generic": {"_0": {"query": target_id, "app": "LINE"}}},
+                },
+            ],
+        }
+        script_path.write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
+        os.chmod(script_path, 0o600)
+        _run_json(
+            [str(peekaboo), "run", str(script_path), "--json", "--no-remote"],
+            timeout=45,
+            stage="open_exact_chat_script",
+        )
+
+
+def open_exact_chat_result(peekaboo: Path, chat_name: str, attempts: int = 3) -> None:
+    """Open one exact search result, retrying only expired Peekaboo snapshots."""
+    for attempt in range(attempts):
+        results = _run_json(
+            [
+                str(peekaboo),
+                "see",
+                "--app",
+                "LINE",
+                "--timeout-seconds",
+                "15",
+                "--no-web-focus",
+                "--json",
+                "--no-remote",
+            ],
+            timeout=25,
+            stage="inspect_search_results",
+        )
+        result_data = results.get("data", {})
+        result_snapshot = result_data.get("snapshot_id") or result_data.get("snapshotId")
+        result_elements = result_data.get("ui_elements") or result_data.get("uiElements") or []
+        if not result_snapshot:
+            raise BridgeError(
+                "safe_chat_result_unavailable",
+                "The exact search result had no valid snapshot; no click or scroll was attempted.",
+                candidateCount=0,
+            )
+        target = resolve_exact_chat_click_target(result_elements, chat_name)
+        try:
+            _run_json(
+                [
+                    str(peekaboo),
+                    "click",
+                    "--on",
+                    str(target["id"]),
+                    "--snapshot",
+                    str(result_snapshot),
+                    "--json",
+                    "--no-remote",
+                ],
+                stage="open_exact_chat",
+            )
+            return
+        except BridgeError as error:
+            stale = error.code == "peekaboo_failed" and error.extra.get("peekabooCode") == "SNAPSHOT_STALE"
+            if not stale:
+                raise
+            if attempt + 1 >= attempts:
+                run_exact_chat_script(peekaboo, str(target["id"]))
+                return
+            time.sleep(0.2)
 
 
 def sync_older_operation(args: dict[str, Any]) -> dict[str, Any]:
@@ -1229,18 +1433,12 @@ def sync_older_operation(args: dict[str, Any]) -> dict[str, Any]:
             str(peekaboo), "see", "--app", "LINE", "--timeout-seconds", "15", "--no-web-focus", "--json", "--no-remote",
         ],
         timeout=25,
+        stage="inspect_line",
     )
     data = seen.get("data", {})
     snapshot = data.get("snapshot_id") or data.get("snapshotId")
     elements = data.get("ui_elements") or data.get("uiElements") or []
-    text_fields = []
-    for element in elements:
-        role = str(element.get("role") or element.get("role_description") or "")
-        frame = element.get("frame") or element.get("bounds") or {}
-        x = float(frame.get("x", 10_000))
-        y = float(frame.get("y", 10_000))
-        if "TextField" in role and x < 700 and y < 450 and element.get("id"):
-            text_fields.append(element)
+    text_fields = [element for element in elements if is_safe_search_field_candidate(element)]
     if not snapshot or len(text_fields) != 1:
         raise BridgeError(
             "safe_search_field_unavailable",
@@ -1249,37 +1447,17 @@ def sync_older_operation(args: dict[str, Any]) -> dict[str, Any]:
         )
     field_id = str(text_fields[0]["id"])
     _run_json(
-        [str(peekaboo), "set-value", chat["name"], "--on", field_id, "--snapshot", str(snapshot), "--json", "--no-remote"]
+        [str(peekaboo), "set-value", chat["name"], "--on", field_id, "--snapshot", str(snapshot), "--json", "--no-remote"],
+        stage="set_search_value",
     )
     time.sleep(1.0)
-    results = _run_json(
-        [
-            str(peekaboo), "see", "--app", "LINE", "--timeout-seconds", "15", "--no-web-focus", "--json", "--no-remote",
-        ],
-        timeout=25,
-    )
-    result_data = results.get("data", {})
-    result_snapshot = result_data.get("snapshot_id") or result_data.get("snapshotId")
-    result_elements = result_data.get("ui_elements") or result_data.get("uiElements") or []
-    exact = []
-    for element in result_elements:
-        labels = [element.get(key) for key in ("label", "title", "value", "name")]
-        if chat["name"] in labels and element.get("id"):
-            exact.append(element)
-    if not result_snapshot or len(exact) != 1:
-        raise BridgeError(
-            "safe_chat_result_unavailable",
-            "Could not identify one exact search result; no click or scroll was attempted.",
-            candidateCount=len(exact),
-        )
-    _run_json(
-        [str(peekaboo), "click", "--on", str(exact[0]["id"]), "--snapshot", str(result_snapshot), "--app", "LINE", "--json", "--no-remote"]
-    )
+    open_exact_chat_result(peekaboo, chat["name"])
     time.sleep(0.8)
     for _round in range(rounds):
         _run_json(
             [str(peekaboo), "scroll", "--direction", "up", "--amount", "12", "--app", "LINE", "--json", "--no-remote"],
             timeout=45,
+            stage="scroll_history",
         )
         time.sleep(1.2)
     with open_database() as (connection, _db, _meta):

@@ -66,7 +66,7 @@ export const TOOLS = Object.freeze([
   },
   {
     name: "refresh_latest",
-    description: "Wait for one exact chat to advance in fresh stable read-only LINE DB snapshots. It first polls passively, then performs only a fixed LINE app activation or fixed LINE app launch when needed. It never selects a chat, focuses the composer, types, pastes, presses keys, or sends messages. Call read_history separately after success.",
+    description: "Verify one exact chat against fresh stable read-only LINE DB snapshots. It first polls passively, then performs only a fixed LINE app activation or fixed LINE app launch when needed. Success reports freshnessVerified=true; targetAdvanced separately states whether a newer target message appeared. It never selects a chat, focuses the composer, types, pastes, presses keys, or sends messages. Call read_history separately after success.",
     inputSchema: {
       type: "object",
       properties: {

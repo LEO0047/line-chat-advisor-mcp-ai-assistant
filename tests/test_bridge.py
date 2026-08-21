@@ -628,6 +628,8 @@ class BridgeTests(unittest.TestCase):
             result = bridge.refresh_latest_operation({"chat": "Exact", "timeoutSeconds": 30})
         self.assertTrue(result["ok"])
         self.assertTrue(result["targetAdvanced"])
+        self.assertTrue(result["freshnessVerified"])
+        self.assertEqual(result["freshnessMode"], "target_advanced")
         self.assertEqual(result["strategy"], "passive")
         focus.assert_not_called()
         launch.assert_not_called()
@@ -650,6 +652,7 @@ class BridgeTests(unittest.TestCase):
             result = bridge.refresh_latest_operation({"chat": "Exact", "timeoutSeconds": 30})
         self.assertEqual(result["strategy"], "focus")
         self.assertTrue(result["targetAdvanced"])
+        self.assertTrue(result["freshnessVerified"])
         focus.assert_called_once()
         launch.assert_not_called()
 
@@ -670,6 +673,7 @@ class BridgeTests(unittest.TestCase):
         ):
             result = bridge.refresh_latest_operation({"chat": "Exact"})
         self.assertEqual(result["strategy"], "launch")
+        self.assertTrue(result["freshnessVerified"])
         launch.assert_called_once()
         focus.assert_not_called()
 
@@ -679,7 +683,7 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(bridge.target_advanced(before, after))
         self.assertFalse(bridge.target_advanced(after, before))
 
-    def test_other_chat_global_update_does_not_advance_target(self):
+    def test_successful_line_activation_verifies_stable_target_without_new_message(self):
         chat = {"chatId": "u1", "name": "Exact", "isGroup": False}
         before = self.refresh_state(100, "m1")
         patches = self.refresh_mocks(running=True)
@@ -693,13 +697,13 @@ class BridgeTests(unittest.TestCase):
                 (False, before, 12, (("db", (3, 4, 5)),)),
             ],
         ):
-            with self.assertRaises(bridge.BridgeError) as caught:
-                bridge.refresh_latest_operation({"chat": "Exact", "timeoutSeconds": 5})
-        payload = caught.exception.payload()
-        self.assertEqual(payload["error"], "target_not_advanced")
-        self.assertFalse(payload["targetAdvanced"])
-        self.assertEqual(payload["globalMessageCountAfter"], 12)
-        self.assertEqual(payload["safety"], bridge.refresh_safety())
+            result = bridge.refresh_latest_operation({"chat": "Exact", "timeoutSeconds": 5})
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["targetAdvanced"])
+        self.assertTrue(result["freshnessVerified"])
+        self.assertEqual(result["freshnessMode"], "stable_after_line_activation")
+        self.assertEqual(result["globalMessageCountAfter"], 12)
+        self.assertEqual(result["safety"], bridge.refresh_safety())
         focus.assert_called_once()
         launch.assert_not_called()
 
@@ -717,6 +721,7 @@ class BridgeTests(unittest.TestCase):
             with self.assertRaises(bridge.BridgeError) as caught:
                 bridge.refresh_latest_operation({"chat": "Exact"})
         self.assertEqual(caught.exception.code, "locked_session_unavailable")
+        self.assertFalse(caught.exception.payload()["freshnessVerified"])
         focus.assert_not_called()
         launch.assert_not_called()
 
@@ -747,6 +752,119 @@ class BridgeTests(unittest.TestCase):
         forbidden = {"type", "paste", "press", "hotkey", "composer", "send", "return", "enter"}
         for command in (focus_command, launch_command):
             self.assertTrue(forbidden.isdisjoint({token.lower() for token in command}))
+
+    def test_run_json_returns_only_redacted_peekaboo_failure_details(self):
+        failed = subprocess.CompletedProcess(
+            args=["peekaboo", "see"],
+            returncode=1,
+            stdout=json.dumps({"success": False, "error": {"code": "WINDOW_NOT_FOUND", "message": "private"}}),
+            stderr="private stderr",
+        )
+        with mock.patch.object(bridge.subprocess, "run", return_value=failed), self.assertRaises(
+            bridge.BridgeError
+        ) as caught:
+            bridge._run_json(["peekaboo", "see"], stage="inspect_line")
+        self.assertEqual(caught.exception.code, "peekaboo_failed")
+        self.assertEqual(
+            caught.exception.extra,
+            {
+                "stage": "inspect_line",
+                "peekabooCode": "WINDOW_NOT_FOUND",
+                "failedCommand": None,
+                "failureReason": "unclassified",
+            },
+        )
+        self.assertNotIn("private", json.dumps(caught.exception.payload()))
+
+    def test_safe_search_field_accepts_current_and_legacy_peekaboo_roles(self):
+        base = {"id": "field", "bounds": {"x": 20, "y": 30, "width": 200, "height": 24}}
+        self.assertTrue(bridge.is_safe_search_field_candidate({**base, "role": "textField"}))
+        self.assertTrue(bridge.is_safe_search_field_candidate({**base, "role": "AXTextField"}))
+        self.assertTrue(bridge.is_safe_search_field_candidate({**base, "role": "searchField"}))
+        self.assertFalse(bridge.is_safe_search_field_candidate({**base, "role": "button"}))
+        self.assertFalse(
+            bridge.is_safe_search_field_candidate(
+                {**base, "role": "textField", "bounds": {"x": 900, "y": 30, "width": 200, "height": 24}}
+            )
+        )
+
+    def test_exact_chat_static_text_resolves_to_smallest_actionable_container(self):
+        elements = [
+            {
+                "id": "label",
+                "label": "Exact",
+                "is_actionable": False,
+                "bounds": {"x": 30, "y": 40, "width": 80, "height": 20},
+            },
+            {
+                "id": "row",
+                "role": "group",
+                "is_actionable": True,
+                "bounds": {"x": 20, "y": 30, "width": 200, "height": 50},
+            },
+            {
+                "id": "list",
+                "role": "group",
+                "is_actionable": True,
+                "bounds": {"x": 0, "y": 0, "width": 500, "height": 500},
+            },
+        ]
+        target = bridge.resolve_exact_chat_click_target(elements, "Exact")
+        self.assertEqual(target["id"], "row")
+
+    def test_open_exact_chat_retries_only_stale_snapshots(self):
+        first = {"data": {"snapshot_id": "s1", "ui_elements": [{"id": "e1", "label": "Exact"}]}}
+        second = {"data": {"snapshot_id": "s2", "ui_elements": [{"id": "e2", "label": "Exact"}]}}
+        stale = bridge.BridgeError(
+            "peekaboo_failed",
+            "failed",
+            stage="open_exact_chat",
+            peekabooCode="SNAPSHOT_STALE",
+        )
+        with mock.patch.object(bridge, "_run_json", side_effect=[first, stale, second, {"success": True}]) as run:
+            bridge.open_exact_chat_result(Path("peekaboo"), "Exact")
+        self.assertEqual(run.call_count, 4)
+        self.assertIn("s1", run.call_args_list[1].args[0])
+        self.assertIn("s2", run.call_args_list[3].args[0])
+        self.assertNotIn("--foreground", run.call_args_list[3].args[0])
+        self.assertNotIn("--app", run.call_args_list[3].args[0])
+
+    def test_open_exact_chat_uses_single_process_script_after_repeated_stale_snapshots(self):
+        observed = {"data": {"snapshot_id": "s", "ui_elements": [{"id": "e", "label": "Exact"}]}}
+        stale = bridge.BridgeError(
+            "peekaboo_failed",
+            "failed",
+            stage="open_exact_chat",
+            peekabooCode="SNAPSHOT_STALE",
+        )
+        with mock.patch.object(
+            bridge,
+            "_run_json",
+            side_effect=[observed, stale, observed, stale, observed, stale],
+        ) as run, mock.patch.object(bridge, "run_exact_chat_script") as script, mock.patch.object(
+            bridge.time, "sleep"
+        ):
+            bridge.open_exact_chat_result(Path("peekaboo"), "Exact")
+        self.assertEqual(run.call_count, 6)
+        script.assert_called_once_with(Path("peekaboo"), "e")
+
+    def test_exact_chat_script_is_bounded_and_deleted_after_use(self):
+        captured = {}
+
+        def inspect_script(command, **kwargs):
+            script_path = Path(command[2])
+            captured["path"] = script_path
+            captured["script"] = json.loads(script_path.read_text(encoding="utf-8"))
+            captured["stage"] = kwargs["stage"]
+            return {"success": True}
+
+        with mock.patch.object(bridge, "_run_json", side_effect=inspect_script):
+            bridge.run_exact_chat_script(Path("peekaboo"), "safe-element-id")
+        self.assertEqual(captured["stage"], "open_exact_chat_script")
+        commands = [step["command"] for step in captured["script"]["steps"]]
+        self.assertEqual(commands, ["see", "click"])
+        self.assertEqual(captured["script"]["steps"][1]["params"]["generic"]["_0"]["query"], "safe-element-id")
+        self.assertFalse(captured["path"].exists())
 
     def test_peekaboo_timeout_is_explicit_and_does_not_fallback(self):
         with mock.patch.object(bridge.subprocess, "run", side_effect=subprocess.TimeoutExpired(["peekaboo"], 5)):

@@ -103,7 +103,8 @@ test("line-chat-advisor skill enforces refresh, incremental context, and one-lin
     assert.ok(index > previous, `${operation} must appear in required order`);
     previous = index;
   }
-  assert.match(skill, /target_not_advanced[\s\S]*stop without calling context or history tools/);
+  assert.match(skill, /Continue[\s\S]*freshnessVerified: true/);
+  assert.match(skill, /freshnessVerified: false[\s\S]*stop without calling context or history tools/);
   assert.match(skill, /order: "oldest"[\s\S]*pagination\.nextCursor/);
   assert.match(skill, /output exactly `現在不用回。`/);
   assert.match(skill, /Never use Computer Use, Chronicle, OCR, screenshots/);

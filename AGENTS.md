@@ -7,7 +7,7 @@ This workspace provides read-only access to the current user's local LINE Deskto
 ## Required behavior
 
 - 每次「讀取 LINE」都必須依序呼叫 `line_status`、`refresh_latest`、`get_relationship_context`，再以 `read_history` 讀取首次完整或後續增量歷史。
-- `refresh_latest` 只有在目標聊天室的 timestamp/message ID 前進時才算成功；`target_not_advanced` 或任何 refresh 錯誤都必須停止，不得讀舊資料假裝最新。
+- `refresh_latest` 必須以新穩定唯讀快照驗證資料。目標 timestamp/message ID 前進時回報 `targetAdvanced: true`；若固定 LINE 啟動／聚焦成功且後續快照穩定，即使沒有新訊息也可回報 `freshnessVerified: true`、`targetAdvanced: false`。任何 refresh 錯誤或 `freshnessVerified: false` 都必須停止，不得讀舊資料假裝最新。
 - 「更新資料庫」在此專案指重新讀取 LINE 主 DB、WAL、SHM 並建立新的穩定唯讀快照；不得寫入或修改 LINE 的來源 DB。
 - 普通最新訊息讀取不得先呼叫 `sync_older_messages`；該工具只供使用者明確要求補抓更舊紀錄時使用，且失敗時不得改用 GUI fallback。
 - 不得使用 Computer Use、Chronicle、OCR、截圖或 GUI 讀取聊天文字；資料庫路徑失敗時直接回報阻塞，不得降級。

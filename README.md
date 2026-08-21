@@ -51,7 +51,7 @@ Reply text is displayed in ChatGPT/Codex only.
 - Login Keychain-only database key retrieval
 - Exact display-name or `chatId` resolution; ambiguous names fail closed
 - Bounded history reads with stable timestamp/message-ID cursor pagination
-- Target-specific latest-message refresh using DB evidence
+- Target-specific latest-message freshness verification using DB evidence
 - First-full-then-incremental local relationship context
 - Optimistic context versions to prevent stale task overwrites
 - A global `line-chat-advisor` Codex skill
@@ -164,7 +164,10 @@ line_status → refresh_latest → get_relationship_context → read_history
             → save_relationship_context
 ```
 
-If freshness cannot be proven, it stops instead of presenting stale content as
+`freshnessVerified` records whether a fresh stable snapshot was verified after
+passive target advancement or a successful fixed LINE activation. The separate
+`targetAdvanced` field records whether a newer target message appeared. If
+freshness cannot be proven, the workflow stops instead of presenting stale content as
 current. If a reply is needed, it returns only one sentence. Otherwise it
 returns `現在不用回。`
 
@@ -241,8 +244,9 @@ line_status → refresh_latest → get_relationship_context → read_history
             → save_relationship_context
 ```
 
-`refresh_latest` 只有在目標聊天室的 timestamp/message ID 前進時才成功；若無法
-證明資料已刷新，skill 會停止，不會拿舊訊息假裝最新。`read_history` 與
+`refresh_latest` 會以 `freshnessVerified` 表示是否已在被動前進或固定 LINE
+啟動／聚焦後取得新的穩定唯讀快照，並以獨立的 `targetAdvanced` 表示目標聊天
+是否真的出現新訊息；若無法證明資料已刷新，skill 會停止，不會拿舊訊息假裝最新。`read_history` 與
 `save_relationship_context` 只會寫入被 Git 忽略、權限為 `0600` 的本機記憶，
 永遠不會修改 LINE 來源 DB。
 

@@ -47,9 +47,10 @@ another tool or an older snapshot.
 2. Call `line_status`. Continue only when `dbFound`, `keyAvailable`, `decryptOk`,
    `databaseSnapshot.readOnly`, and `databaseSnapshot.queryOnly` are all true.
 3. Call `refresh_latest` for the exact chat with `timeoutSeconds: 30`.
-   Continue only when `ok: true` and `targetAdvanced: true`. For
-   `target_not_advanced`, `locked_session_unavailable`, focus/launch failure, or
-   any other error, stop without calling context or history tools.
+   Continue when `ok: true` and `freshnessVerified: true`; `targetAdvanced`
+   separately states whether a newer target message appeared. For
+   `freshnessVerified: false`, `locked_session_unavailable`, focus/launch
+   failure, or any other error, stop without calling context or history tools.
 4. Call `get_relationship_context` for the same exact chat.
 5. If `initialized` is false, call `read_history` with `order: "oldest"` and
    `limit: 200`; follow every `pagination.nextCursor` until `hasMore` is false.
