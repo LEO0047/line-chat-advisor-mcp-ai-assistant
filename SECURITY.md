@@ -44,3 +44,12 @@ logs.
 
 本專案的核心安全邊界是：LINE 來源 DB 永遠唯讀、金鑰只來自 Login Keychain、
 MCP 沒有傳送訊息與通用輸入工具、本機關係摘要永不進 Git。
+
+## Attachment boundary (0.2.0)
+
+Attachment retrieval is an explicit network operation to the fixed LINE OBS HTTPS host.
+It reuses the current Desktop credential from the same read-only snapshot; a missing
+cache can use a separately provisioned Keychain token. Redirects are rejected.
+Keys and tokens never appear in MCP results. Encrypted payloads require HMAC validation;
+size limits and image decoding checks apply. Exports are confined to Downloads, do not
+overwrite existing files, and are private local user data. No send or login tool is added.

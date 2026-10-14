@@ -1,0 +1,7 @@
+#!/bin/zsh
+set -euo pipefail
+
+project_root=${0:A:h:h}
+mkdir -p "$project_root/runtime/bin"
+/usr/bin/swiftc "$project_root/src/line-readonly-mcp/line-history-accessibility.swift" \
+  -o "$project_root/runtime/bin/line-history-accessibility"

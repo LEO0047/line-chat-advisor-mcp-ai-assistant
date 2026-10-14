@@ -15,6 +15,8 @@ const python = join(projectRoot, ".venv", "bin", "python3");
 const bridge = join(here, "bridge.py");
 
 export const ALLOWED_TOOLS = Object.freeze([
+  "download_attachment",
+  "get_attachment_info",
   "line_status",
   "list_chats",
   "read_history",
@@ -27,6 +29,33 @@ export const ALLOWED_TOOLS = Object.freeze([
 const allowed = new Set(ALLOWED_TOOLS);
 
 export const TOOLS = Object.freeze([
+  {
+    name: "download_attachment",
+    description: "Download one exact LINE file or image attachment directly from LINE OBS, decrypt and verify it, and save without overwriting under Downloads. Images are decoded for validation and saved byte-for-byte without resizing or thumbnail fallback. Reuses Desktop's OBS credential from the same fresh read-only DB snapshot; a separately provisioned Keychain token is used only when that cache is absent. Desktop owns credential renewal; server rejection fails explicitly. No GUI, app activation, message input or sending. Never returns keys or tokens. Supports files/images up to 64 MiB with declared size, not video/audio messages.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        chat: { type: "string", minLength: 1, maxLength: 512 },
+        messageId: { type: "string", minLength: 1, maxLength: 256 },
+        destinationDir: { type: "string", minLength: 1, maxLength: 4096 },
+      },
+      required: ["chat", "messageId", "destinationDir"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_attachment_info",
+    description: "Get safe attachment filename, expected byte size and expiry for one exact chat/message from a fresh read-only snapshot. Does not return encryption keys or download URLs. Use download_attachment for programmatic file retrieval; metadata alone is not a downloaded file.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        chat: { type: "string", minLength: 1, maxLength: 512 },
+        messageId: { type: "string", minLength: 1, maxLength: 256 },
+      },
+      required: ["chat", "messageId"],
+      additionalProperties: false,
+    },
+  },
   {
     name: "line_status",
     description: "Refresh and verify a new stable read-only snapshot of the local LINE DB, then report discovery, Keychain availability, decryption, LINE process state, and snapshot time without returning secrets or chat content. Call this before every LINE read task.",
@@ -66,7 +95,7 @@ export const TOOLS = Object.freeze([
   },
   {
     name: "refresh_latest",
-    description: "Wait for one exact chat to advance in fresh stable read-only LINE DB snapshots. It first polls passively, then performs only a fixed LINE app activation or fixed LINE app launch when needed. It never selects a chat, focuses the composer, types, pastes, presses keys, or sends messages. Call read_history separately after success.",
+    description: "Refresh stable read-only local LINE DB snapshots for one exact chat. When locked, poll passively for the requested window or until the target advances; otherwise a fixed LINE activation/launch may be used. ok=true and localSnapshotRefreshed=true permit read_history. targetAdvanced is only local message progress, not proof of server completeness. Without a server acknowledgement, freshnessVerified=false, syncComplete=null and serverWatermark=null even after activation. It never selects a chat, focuses the composer, types, pastes, presses keys, or sends messages.",
     inputSchema: {
       type: "object",
       properties: {
@@ -125,7 +154,7 @@ export const TOOLS = Object.freeze([
   },
   {
     name: "sync_older_messages",
-    description: "Best-effort, narrowly constrained older-history UI backfill. Do not use it to refresh ordinary latest-message reads: use line_status, refresh_latest, then read_history. It can only resolve an existing exact chat and use the audited Peekaboo adapter; it never focuses the composer, types/pastes a message, or presses Return.",
+    description: "Best-effort bounded history loading for one existing exact chat that is ALREADY OPEN and focused in LINE. It validates the window title and a unique history list before wheel-only scrolling. It never searches or clicks, activates another window, focuses a composer, types/pastes, presses keys, or sends. A missing/unverified history pane fails explicitly. Read actual messages using read_history afterward; successful scrolling is not proof of complete server history.",
     inputSchema: {
       type: "object",
       properties: {
@@ -173,7 +202,7 @@ function textResult(value) {
 
 export function createServer() {
   const server = new Server(
-    { name: "line-readonly-mcp", version: "0.1.0" },
+    { name: "line-readonly-mcp", version: "0.2.0" },
     { capabilities: { tools: {} } },
   );
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));

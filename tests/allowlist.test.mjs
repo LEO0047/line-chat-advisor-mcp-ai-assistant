@@ -8,6 +8,8 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { ALLOWED_TOOLS, TOOLS } from "../src/line-readonly-mcp/server.mjs";
 
 const expected = [
+  "download_attachment",
+  "get_attachment_info",
   "line_status",
   "list_chats",
   "read_history",
@@ -69,7 +71,7 @@ test("read_history exposes bounded timestamp and message ID cursor pagination", 
 test("real stdio MCP handshake lists the exact allow-list and calls line_status", async () => {
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [fileURLToPath(new URL("../src/line-readonly-mcp/server.mjs", import.meta.url))],
+    args: [fileURLToPath(new URL("../bin/line-context-relay.mjs", import.meta.url))],
     stderr: "pipe",
   });
   const client = new Client({ name: "line-readonly-test", version: "0.1.0" });
@@ -88,7 +90,7 @@ test("real stdio MCP handshake lists the exact allow-list and calls line_status"
   }
 });
 
-test("line-chat-advisor skill enforces refresh, incremental context, and one-line output", () => {
+test("line-chat-advisor skill retains ordered read-only context workflow", () => {
   const skill = readFileSync(new URL("../skills/line-chat-advisor/SKILL.md", import.meta.url), "utf8");
   const ordered = [
     "`line_status`",
@@ -103,9 +105,8 @@ test("line-chat-advisor skill enforces refresh, incremental context, and one-lin
     assert.ok(index > previous, `${operation} must appear in required order`);
     previous = index;
   }
-  assert.match(skill, /target_not_advanced[\s\S]*stop without calling context or history tools/);
   assert.match(skill, /order: "oldest"[\s\S]*pagination\.nextCursor/);
   assert.match(skill, /output exactly `現在不用回。`/);
-  assert.match(skill, /Never use Computer Use, Chronicle, OCR, screenshots/);
+  assert.match(skill, /For chat text, use the read-only MCP, never GUI\/OCR/);
   assert.match(skill, /Never transmit the proposed sentence to LINE/);
 });

@@ -9,8 +9,11 @@ with APSW SQLITE_OPEN_READONLY and query_only enabled.
 from __future__ import annotations
 
 import contextlib
+import base64
 import datetime as dt
 import hashlib
+import hmac
+import io
 import json
 import math
 import os
@@ -18,10 +21,15 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import warnings
 from typing import Any, Iterator
 
 
@@ -46,7 +54,13 @@ ALLOWED_TOOLS = [
     "save_relationship_context",
     "sync_older_messages",
     "line_health",
+    "get_attachment_info",
+    "download_attachment",
 ]
+OBS_KEYCHAIN_SERVICE = "line-readonly-obs-token"
+MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
+MAX_IMAGE_FRAMES = 500
 CONTEXT_TEXT_LIMIT = 4_000
 REFRESH_POLL_SECONDS = 0.25
 REFRESH_SNAPSHOT_MIN_SECONDS = 1.0
@@ -886,6 +900,301 @@ def read_history_operation(args: dict[str, Any]) -> dict[str, Any]:
     return history
 
 
+def attachment_info(connection: Any, chat_id: str, message_id: str) -> dict[str, Any]:
+    row = connection.execute(
+        "SELECT _createdTime,_text,_contentType,_contentMetadata FROM _message "
+        "WHERE _chatId=? AND CAST(_id AS TEXT)=?", (chat_id, message_id)
+    ).fetchone()
+    if not row:
+        raise BridgeError("attachment_not_found", "Message does not exist in the specified chat.")
+    created, name, kind, raw = row
+    if kind not in (1, 2, 3, 14):
+        raise BridgeError("not_attachment", "Message is not a downloadable attachment.")
+    try:
+        metadata = json.loads(raw or "{}")
+        if not isinstance(metadata, dict):
+            metadata = {}
+    except (ValueError, TypeError):
+        metadata = {}
+    def number(key: str) -> int | None:
+        value = metadata.get(key)
+        return int(value) if isinstance(value, (str, int)) and str(value).isdigit() else None
+    # Explicit allow-list: never expose contentInfo, encryption material, OID,
+    # cookies, tokens or remote URLs. Download secrets stay inside the bridge.
+    return {
+        "messageId": message_id, "absoluteTime": iso_time(created),
+        "messageType": MESSAGE_TYPES[kind],
+        "fileName": name if kind == 14 else None,
+        "expectedBytes": number("FILE_SIZE"),
+        "expiresAt": iso_time(number("FILE_EXPIRE_TIMESTAMP")),
+        "downloadMethod": "programmatic_obs" if kind in (1, 14) else "unsupported_media_type",
+        "downloaded": False,
+    }
+
+
+def get_attachment_info_operation(args: dict[str, Any]) -> dict[str, Any]:
+    chat_value, message_id = args.get("chat"), args.get("messageId")
+    if not isinstance(chat_value, str) or not chat_value.strip():
+        raise BridgeError("invalid_chat", "chat is required.")
+    if not isinstance(message_id, str) or not message_id or len(message_id) > 256:
+        raise BridgeError("invalid_message_id", "messageId is required and must be at most 256 characters.")
+    with open_database() as (connection, _db, _meta):
+        chat = resolve_chat(connection, chat_value)
+        return {"ok": True, "chatId": chat["chatId"], "name": chat["name"],
+                "attachment": attachment_info(connection, chat["chatId"], message_id),
+                "databaseSnapshot": snapshot_metadata()}
+
+
+def keychain_obs_token() -> str:
+    """A separately provisioned LINE OBS token, never the DB encryption key."""
+    try:
+        result = subprocess.run(
+            ["/usr/bin/security", "find-generic-password", "-s", OBS_KEYCHAIN_SERVICE, "-w"],
+            check=True, capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.SubprocessError, OSError):
+        raise BridgeError("attachment_auth_required", "An authorized LINE OBS access token is not provisioned in Keychain.")
+    return validate_obs_token(result.stdout.strip())
+
+
+def validate_obs_token(token: Any) -> str:
+    if not isinstance(token, str) or not token or len(token) > 16384 or any(ord(c) < 33 or ord(c) > 126 for c in token):
+        raise BridgeError("attachment_auth_invalid", "The LINE OBS credential is malformed.")
+    return token
+
+
+def attachment_obs_token(connection: Any) -> tuple[str, str]:
+    """Reuse Desktop's OBS credential from the same read-only message snapshot.
+
+    Never persist or return the secret in MCP output. Desktop owns renewal;
+    the server, not the opaque cached timestamp, determines validity. Only a
+    missing cache permits the explicitly provisioned Keychain alternative.
+    """
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='_setting'").fetchone():
+        row = connection.execute("SELECT _value FROM _setting WHERE _key='setting'").fetchone()
+        if row and row[0]:
+            try:
+                settings = json.loads(row[0])
+                if not isinstance(settings, dict):
+                    raise ValueError()
+                cached = settings.get("obsTokenGeneral")
+                if cached is not None and not isinstance(cached, dict):
+                    raise ValueError()
+            except (ValueError, TypeError):
+                raise BridgeError("attachment_auth_invalid", "LINE's local OBS credential cache is malformed.") from None
+            if cached is not None and cached.get("token") not in (None, ""):
+                return validate_obs_token(cached["token"]), "desktop_snapshot"
+    try:
+        return keychain_obs_token(), "keychain"
+    except BridgeError as error:
+        if error.code != "attachment_auth_required":
+            raise
+        raise BridgeError("attachment_auth_required", "No authorized OBS credential is available in LINE's local snapshot or Keychain.") from None
+
+
+class _NoAttachmentRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def fetch_attachment_bytes(oid: str, sid: str, token: str, message_id: str) -> bytes:
+    if sid not in {"emf", "emi", "m"} or not isinstance(oid, str) or not re.fullmatch(r"[A-Za-z0-9_=-]{1,2048}", oid):
+        raise BridgeError("attachment_metadata_invalid", "Invalid attachment object identifier.")
+    if not isinstance(message_id, str) or not message_id or len(message_id) > 256:
+        raise BridgeError("invalid_message_id", "A bounded messageId is required.")
+    url = "https://obs.line-apps.com/r/talk/" + sid + "/" + urllib.parse.quote(oid, safe="")
+    headers = {"X-Line-Access": validate_obs_token(token), "User-Agent": "LINE-Context-Relay/0.1"}
+    # Required for encrypted emf objects too: the credential alone does not
+    # establish which message grants access to the requested attachment.
+    encoded_id = message_id.encode("utf-8")
+    thrift = b"\x0b\x00\x04" + struct.pack(">I", len(encoded_id)) + encoded_id + b"\x0f\x00\x1b\x0c\x00\x00\x00\x00\x00"
+    headers["X-Talk-Meta"] = base64.b64encode(json.dumps({"message": base64.b64encode(thrift).decode()}).encode()).decode()
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.build_opener(_NoAttachmentRedirect).open(request, timeout=30) as response:
+            if response.status != 200:
+                raise BridgeError("attachment_not_ready", "LINE did not return a completed attachment.", httpStatus=response.status)
+            declared = response.headers.get("Content-Length")
+            if declared and declared.isdigit() and int(declared) > MAX_ATTACHMENT_BYTES + 32:
+                raise BridgeError("attachment_too_large", "Attachment exceeds the 64 MiB limit.")
+            result = response.read(MAX_ATTACHMENT_BYTES + 33)
+    except urllib.error.HTTPError as error:
+        status = error.code
+        error.close()
+        code = "attachment_auth_rejected" if status in (401, 403) else "attachment_download_failed"
+        raise BridgeError(code, "LINE rejected the attachment request.", httpStatus=status) from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise BridgeError("attachment_network_error", "Could not download the attachment from LINE.") from None
+    if len(result) > MAX_ATTACHMENT_BYTES + 32:
+        raise BridgeError("attachment_too_large", "Attachment exceeds the 64 MiB limit.")
+    return result
+
+
+def decrypt_attachment_bytes(data: bytes, key_material: str) -> bytes:
+    # LINE file format: AES-256-CTR ciphertext followed by HMAC-SHA256.
+    # HKDF-SHA256(no salt, info=FileEncryption): enc(32), mac(32), nonce(12).
+    try:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    except ImportError:
+        raise BridgeError("attachment_dependency_missing", "Install the pinned attachment dependencies.") from None
+    try:
+        material = base64.b64decode(key_material, validate=True)
+    except (ValueError, TypeError):
+        raise BridgeError("attachment_key_invalid", "Invalid attachment key material.") from None
+    if len(material) != 32 or len(data) < 32:
+        raise BridgeError("attachment_key_invalid", "Invalid attachment encryption metadata or payload.")
+    derived = HKDF(algorithm=hashes.SHA256(), length=76, salt=None, info=b"FileEncryption").derive(material)
+    ciphertext, tag = data[:-32], data[-32:]
+    expected = hmac.digest(derived[32:64], ciphertext, "sha256")
+    if not hmac.compare_digest(tag, expected):
+        raise BridgeError("attachment_integrity_failed", "Attachment authentication failed; no file was saved.")
+    decryptor = Cipher(algorithms.AES(derived[:32]), modes.CTR(derived[64:76] + b"\0" * 4)).decryptor()
+    return decryptor.update(ciphertext) + decryptor.finalize()
+
+
+def attachment_destination(value: Any) -> Path:
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise BridgeError("invalid_destination", "destinationDir must be an absolute path under Downloads.")
+    destination = Path(value).resolve()
+    if not destination.is_relative_to((Path.home() / "Downloads").resolve()):
+        raise BridgeError("invalid_destination", "Attachment export is limited to the user's Downloads folder.")
+    return destination
+
+
+def validate_image_bytes(data: bytes) -> dict[str, Any]:
+    """Decode for validation only; exported bytes are never resized/re-encoded."""
+    try:
+        from PIL import Image
+    except ImportError:
+        raise BridgeError("attachment_dependency_missing", "Install the pinned attachment dependencies.") from None
+    extensions = {"JPEG": "jpg", "PNG": "png", "GIF": "gif", "WEBP": "webp", "BMP": "bmp", "TIFF": "tiff"}
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as img:
+                format_name = img.format
+                width, height = img.size
+                if format_name not in extensions:
+                    raise BridgeError("unsupported_image_format", "The downloaded image format is not supported; no file was saved.")
+                if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
+                    raise BridgeError("attachment_image_too_large", "Image exceeds the decoded-pixel limit; no file was saved.")
+                img.verify()
+            with Image.open(io.BytesIO(data)) as img:
+                frames = 0
+                total_pixels = 0
+                while True:
+                    total_pixels += img.width * img.height
+                    frames += 1
+                    if total_pixels > MAX_IMAGE_PIXELS or frames > MAX_IMAGE_FRAMES:
+                        raise BridgeError("attachment_image_too_large", "Image exceeds the frame or decoded-pixel limit; no file was saved.")
+                    img.load()
+                    try:
+                        img.seek(frames)
+                    except EOFError:
+                        break
+    except BridgeError:
+        raise
+    except Exception:
+        raise BridgeError("attachment_format_mismatch", "Downloaded data is not a complete supported image; no file was saved.") from None
+    return {"format": format_name, "extension": extensions[format_name], "width": width, "height": height, "frames": frames}
+
+
+def save_attachment_bytes(destination: Path, name: str, message_id: str, data: bytes) -> dict[str, Any]:
+    # Sanitize sender-provided names; never use them as paths or overwrite data.
+    name = re.sub(r"[\\/\x00-\x1f:]", "_", name).strip(" .") or "attachment.bin"
+    if len(name.encode("utf-8")) > 200:
+        raise BridgeError("attachment_filename_invalid", "Attachment filename is too long.")
+    digest = hashlib.sha256(data).hexdigest()
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(prefix=".line-download-", dir=destination)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        for index in range(100):
+            suffix = "" if index == 0 else f"-{hashlib.sha256(message_id.encode()).hexdigest()[:12]}-{index}"
+            target = destination / (Path(name).stem + suffix + Path(name).suffix)
+            try:
+                os.link(temporary, target)  # atomic, exclusive: existing targets are untouched
+                return {"path": str(target), "bytes": len(data), "sha256": digest}
+            except FileExistsError:
+                # Never follow an existing symlink while checking a duplicate.
+                try:
+                    existing_fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    with os.fdopen(existing_fd, "rb") as existing:
+                        import stat
+                        if stat.S_ISREG(os.fstat(existing.fileno()).st_mode) and os.fstat(existing.fileno()).st_size == len(data):
+                            if hashlib.sha256(existing.read()).hexdigest() == digest:
+                                return {"path": str(target), "bytes": len(data), "sha256": digest, "alreadyPresent": True}
+                except OSError:
+                    pass
+        raise BridgeError("attachment_name_collision", "Could not choose a non-conflicting filename.")
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def download_attachment_operation(args: dict[str, Any]) -> dict[str, Any]:
+    value, message_id = args.get("chat"), args.get("messageId")
+    if not isinstance(value, str) or not value.strip():
+        raise BridgeError("invalid_chat", "chat is required.")
+    if not isinstance(message_id, str) or not message_id or len(message_id) > 256:
+        raise BridgeError("invalid_message_id", "A bounded messageId is required.")
+    destination = attachment_destination(args.get("destinationDir"))
+    with open_database() as (connection, _db, _meta):
+        chat = resolve_chat(connection, value)
+        info = attachment_info(connection, chat["chatId"], message_id)
+        if info["messageType"] not in {"file", "image"}:
+            raise BridgeError("unsupported_attachment_type", "Programmatic export supports file and image messages only.")
+        raw_metadata, raw_content = connection.execute(
+            "SELECT _contentMetadata,_contentInfo FROM _message WHERE _chatId=? AND CAST(_id AS TEXT)=?",
+            (chat["chatId"], message_id),
+        ).fetchone()
+        token, auth_source = attachment_obs_token(connection)
+        snapshot = snapshot_metadata()
+    try:
+        metadata, content = json.loads(raw_metadata or "{}"), json.loads(raw_content or "{}")
+        if not isinstance(metadata, dict) or not isinstance(content, dict):
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise BridgeError("attachment_metadata_invalid", "Attachment metadata is not readable.") from None
+    expected = info["expectedBytes"]
+    if expected is None or expected <= 0 or expected > MAX_ATTACHMENT_BYTES:
+        raise BridgeError("attachment_size_unsupported", "A positive declared file size up to 64 MiB is required.")
+    encrypted = bool(metadata.get("OID"))
+    is_image = info["messageType"] == "image"
+    sid = ("emi" if is_image else "emf") if encrypted else "m"
+    if metadata.get("DOWNLOAD_URL") or metadata.get("SID") not in (None, "", sid):
+        raise BridgeError("attachment_metadata_unsupported", "Attachment requires an unsupported download route.")
+    if not encrypted and (metadata.get("e2eeMark") or content.get("keyMaterial")):
+        raise BridgeError("attachment_metadata_invalid", "Encrypted attachment object identifier is missing.")
+    material = content.get("keyMaterial")
+    if encrypted and not isinstance(material, str):
+        raise BridgeError("attachment_key_missing", "The local message does not contain a decrypted attachment key.")
+    data = fetch_attachment_bytes(metadata["OID"] if encrypted else message_id, sid, token, message_id)
+    if encrypted:
+        data = decrypt_attachment_bytes(data, material)
+    if len(data) != expected:
+        raise BridgeError("attachment_size_mismatch", "Downloaded file size does not match LINE metadata; no file was saved.")
+    image_info = validate_image_bytes(data) if is_image else None
+    if is_image:
+        stamp = dt.datetime.fromisoformat(info["absoluteTime"]).strftime("%Y-%m-%d_%H%M%S") if info["absoluteTime"] else "undated"
+        name = f"{stamp}_image_{hashlib.sha256(message_id.encode()).hexdigest()[:12]}.{image_info['extension']}"
+    else:
+        name = content.get("fileName") or info["fileName"]
+    if not isinstance(name, str) or not name:
+        raise BridgeError("attachment_filename_invalid", "No attachment filename is available.")
+    if name.lower().endswith(".pdf") and not data.startswith(b"%PDF-"):
+        raise BridgeError("attachment_format_mismatch", "Downloaded data is not a PDF; no file was saved.")
+    saved = save_attachment_bytes(destination, name, message_id, data)
+    return {"ok": True, "chatId": chat["chatId"], "messageId": message_id,
+            "downloaded": True, "method": "programmatic_obs", "integrityVerified": encrypted,
+            "authSource": auth_source, "databaseSnapshot": snapshot, **saved,
+            **({"image": image_info} if image_info else {})}
+
+
 def refresh_safety() -> dict[str, bool]:
     return {
         "typed": False,
@@ -1056,6 +1365,7 @@ def refresh_result(
     chat: dict[str, Any],
     strategy: str,
     advanced: bool,
+    activated: bool,
     before: dict[str, Any],
     after: dict[str, Any],
     global_before: int,
@@ -1067,6 +1377,16 @@ def refresh_result(
         "name": chat["name"],
         "strategy": strategy,
         "targetAdvanced": advanced,
+        "localSnapshotRefreshed": True,
+        # Local changes (including outgoing messages) and app activation are
+        # not a server acknowledgement that the conversation is complete.
+        "freshnessVerified": False,
+        "syncComplete": None,
+        "serverWatermark": None,
+        "syncLimitation": "No authoritative server synchronization acknowledgement is available.",
+        "freshnessMode": (
+            "target_advanced" if advanced else ("stable_after_line_activation" if activated else "local_snapshot")
+        ),
         "before": before,
         "after": after,
         "globalMessageCountBefore": global_before,
@@ -1098,6 +1418,7 @@ def refresh_latest_operation(args: dict[str, Any]) -> dict[str, Any]:
                 chat=chat,
                 strategy="passive",
                 advanced=True,
+                activated=False,
                 before=before,
                 after=after,
                 global_before=global_before,
@@ -1107,21 +1428,26 @@ def refresh_latest_operation(args: dict[str, Any]) -> dict[str, Any]:
         }
 
     if graphical_session_available() is False:
-        details = refresh_result(
-            chat=chat,
-            strategy="passive",
-            advanced=False,
-            before=before,
-            after=after,
-            global_before=global_before,
-            global_after=global_after,
-            started=started,
+        # Keep observing for the remainder of the requested window. A locked
+        # graphical session does not prevent a stable local DB read.
+        advanced, after, global_after, _signature = poll_target_advance(
+            chat["chatId"], before, global_before, deadline, signature
         )
-        raise BridgeError(
-            "locked_session_unavailable",
-            "The macOS graphical session is locked or no console user is available; no UI action was attempted.",
-            **details,
-        )
+        return {
+            "ok": True,
+            "activationSkipped": "locked_session",
+            **refresh_result(
+                chat=chat,
+                strategy="passive",
+                advanced=advanced,
+                activated=False,
+                before=before,
+                after=after,
+                global_before=global_before,
+                global_after=global_after,
+                started=started,
+            ),
+        }
 
     strategy = "focus" if line_running() else "launch"
     if not _peekaboo_path().is_file():
@@ -1129,6 +1455,7 @@ def refresh_latest_operation(args: dict[str, Any]) -> dict[str, Any]:
             chat=chat,
             strategy=strategy,
             advanced=False,
+            activated=False,
             before=before,
             after=after,
             global_before=global_before,
@@ -1151,6 +1478,7 @@ def refresh_latest_operation(args: dict[str, Any]) -> dict[str, Any]:
             chat=chat,
             strategy=strategy,
             advanced=False,
+            activated=False,
             before=before,
             after=after,
             global_before=global_before,
@@ -1166,18 +1494,13 @@ def refresh_latest_operation(args: dict[str, Any]) -> dict[str, Any]:
         chat=chat,
         strategy=strategy,
         advanced=advanced,
+        activated=True,
         before=before,
         after=after,
         global_before=global_before,
         global_after=global_after,
         started=started,
     )
-    if not advanced:
-        raise BridgeError(
-            "target_not_advanced",
-            "The target chat did not advance before timeout; no stale success was reported.",
-            **details,
-        )
     return {"ok": True, **details}
 
 
@@ -1186,24 +1509,181 @@ def _peekaboo_path() -> Path:
     return project_binary if project_binary.is_file() else Path("/opt/homebrew/bin/peekaboo")
 
 
-def _run_json(command: list[str], timeout: int = 30) -> dict[str, Any]:
+def _run_json(command: list[str], timeout: int = 30, stage: str = "peekaboo_action") -> dict[str, Any]:
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise BridgeError(
             "peekaboo_timeout",
             "Peekaboo did not finish the audited UI snapshot within the safety timeout; no fallback input was attempted.",
+            stage=stage,
         )
-    if result.returncode != 0:
-        raise BridgeError("peekaboo_failed", "The audited Peekaboo command failed.")
     try:
-        return json.loads(result.stdout)
+        payload = json.loads(result.stdout)
     except json.JSONDecodeError:
-        raise BridgeError("peekaboo_invalid_output", "Peekaboo did not return valid JSON.")
+        if result.returncode != 0:
+            raise BridgeError(
+                "peekaboo_failed",
+                "The audited Peekaboo command failed without valid JSON.",
+                stage=stage,
+            )
+        raise BridgeError("peekaboo_invalid_output", "Peekaboo did not return valid JSON.", stage=stage)
+    if not isinstance(payload, dict):
+        raise BridgeError("peekaboo_invalid_output", "Peekaboo did not return a JSON object.", stage=stage)
+    if result.returncode != 0 or payload.get("success") is False:
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        steps = data.get("steps") if isinstance(data.get("steps"), list) else []
+        failed = next((step for step in steps if isinstance(step, dict) and step.get("success") is False), {})
+        failure_text = str(failed.get("error") or error.get("message") or "").casefold()
+        if "snapshot" in failure_text and "stale" in failure_text:
+            failure_reason = "snapshot_stale"
+        elif "element" in failure_text and ("not found" in failure_text or "no element" in failure_text):
+            failure_reason = "element_not_found"
+        elif "invalid" in failure_text and "parameter" in failure_text:
+            failure_reason = "invalid_parameters"
+        else:
+            failure_reason = "unclassified"
+        raise BridgeError(
+            "peekaboo_failed",
+            "The audited Peekaboo command failed.",
+            stage=stage,
+            peekabooCode=error.get("code"),
+            failedCommand=failed.get("command"),
+            failureReason=failure_reason,
+        )
+    return payload
+
+
+def is_safe_search_field_candidate(element: dict[str, Any]) -> bool:
+    """Match current Peekaboo textField and older AXTextField role spellings."""
+    role = str(element.get("role") or element.get("role_description") or "")
+    normalized_role = re.sub(r"[^a-z]", "", role.casefold())
+    frame = element.get("frame") or element.get("bounds") or {}
+    x = float(frame.get("x", 10_000))
+    y = float(frame.get("y", 10_000))
+    return (
+        normalized_role in {"textfield", "axtextfield", "searchfield", "axsearchfield"}
+        and x < 700
+        and y < 450
+        and bool(element.get("id"))
+    )
+
+
+def _element_bounds(element: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    bounds = element.get("frame") or element.get("bounds") or {}
+    try:
+        return (
+            float(bounds["x"]),
+            float(bounds["y"]),
+            float(bounds["width"]),
+            float(bounds["height"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def resolve_exact_chat_click_target(elements: list[dict[str, Any]], chat_name: str) -> dict[str, Any]:
+    exact = []
+    for element in elements:
+        labels = [element.get(key) for key in ("label", "title", "value", "name")]
+        if chat_name in labels and element.get("id"):
+            exact.append(element)
+    if len(exact) != 1:
+        raise BridgeError(
+            "safe_chat_result_unavailable",
+            "Could not identify one exact search result; no click or scroll was attempted.",
+            candidateCount=len(exact),
+        )
+    label = exact[0]
+    if label.get("is_actionable") is not False:
+        return label
+    label_bounds = _element_bounds(label)
+    if label_bounds is None:
+        raise BridgeError(
+            "safe_chat_result_unavailable",
+            "The exact search result had no safe actionable container; no click or scroll was attempted.",
+            candidateCount=0,
+        )
+    x, y, width, height = label_bounds
+    center_x = x + width / 2
+    center_y = y + height / 2
+    containers = []
+    for element in elements:
+        if not element.get("id") or element.get("is_actionable") is not True:
+            continue
+        bounds = _element_bounds(element)
+        if bounds is None:
+            continue
+        item_x, item_y, item_width, item_height = bounds
+        if item_x <= center_x <= item_x + item_width and item_y <= center_y <= item_y + item_height:
+            containers.append((item_width * item_height, element))
+    if not containers:
+        raise BridgeError(
+            "safe_chat_result_unavailable",
+            "The exact search result had no safe actionable container; no click or scroll was attempted.",
+            candidateCount=0,
+        )
+    containers.sort(key=lambda item: item[0])
+    if len(containers) > 1 and containers[0][0] == containers[1][0]:
+        raise BridgeError(
+            "safe_chat_result_unavailable",
+            "The exact search result had ambiguous actionable containers; no click or scroll was attempted.",
+            candidateCount=2,
+        )
+    return containers[0][1]
+
+
+
+
+def history_helper_path() -> Path:
+    return ROOT / "runtime" / "bin" / "line-history-accessibility"
+
+
+def run_history_helper(chat_name: str, rounds: int) -> dict[str, Any]:
+    """Fixed native adapter: already-open exact window and verified history only."""
+    if not chat_name or len(chat_name) > 256 or not 1 <= rounds <= 20:
+        raise BridgeError("history_ui_invalid_request", "The exact chat name or bounded round count is invalid.")
+    helper = history_helper_path()
+    if not helper.is_file():
+        raise BridgeError("history_ui_helper_missing", "Build the reviewed native history helper before backfill.")
+    try:
+        result = subprocess.run(
+            [str(helper), "load", chat_name, str(rounds)],
+            capture_output=True, text=True, timeout=28 + rounds * 2,
+        )
+    except subprocess.TimeoutExpired:
+        raise BridgeError("history_ui_timeout", "The bounded history adapter timed out; no input fallback was attempted.")
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        raise BridgeError("history_ui_invalid_output", "The native adapter returned no valid metadata.")
+    if not isinstance(payload, dict):
+        raise BridgeError("history_ui_invalid_output", "The native adapter returned no metadata object.")
+    if result.returncode != 0 or payload.get("ok") is not True:
+        safe_reasons = {
+            "accessibility_permission_required", "line_not_running", "line_window_unavailable",
+            "safe_search_field_unavailable", "search_field_not_settable", "search_container_unavailable",
+            "set_search_value_failed", "exact_chat_result_unavailable", "exact_result_not_verified",
+            "open_exact_result_failed", "opened_chat_identity_unverified", "history_pane_unverified",
+            "history_target_changed", "screen_capture_permission_required",
+        }
+        reason = payload.get("error")
+        checks = {
+            key: payload[key] for key in ("windowTitleMatches", "lineFrontmost")
+            if type(payload.get(key)) is bool
+        } if reason == "opened_chat_identity_unverified" else {}
+        raise BridgeError("history_ui_failed", "The fixed history adapter stopped without a keyboard fallback.",
+                          reason=reason if reason in safe_reasons else "unclassified",
+                          **({"identityChecks": checks} if checks else {}))
+    if payload.get("openedExactResult") is not True or payload.get("historyPaneVerified") is not True or payload.get("completedRounds") != rounds:
+        raise BridgeError("history_ui_unverified", "The exact chat/history pane or completed round count was not verified.")
+    return {"adapter": "bounded_native_ax", "historyPaneVerified": True, "completedRounds": rounds,
+            "searchResultOCRUsed": payload.get("usedResultOCR") is True}
 
 
 def sync_older_operation(args: dict[str, Any]) -> dict[str, Any]:
-    """Use only set-value/click/scroll; never type, paste, press, hotkey, or shell."""
+    """Scroll an already-open exact chat; never search, click, type, or send."""
     value = str(args.get("chat", "")).strip()
     rounds = max(1, min(int(args.get("rounds", 5)), 20))
     with open_database() as (connection, _db, _meta):
@@ -1216,72 +1696,9 @@ def sync_older_operation(args: dict[str, Any]) -> dict[str, Any]:
         )
     if not line_running():
         raise BridgeError("line_not_running", "LINE must be running for older-message backfill.")
-    peekaboo = _peekaboo_path()
-    if not peekaboo.is_file():
-        raise BridgeError("peekaboo_missing", "The project-local/system Peekaboo binary is unavailable.")
-
-    help_result = subprocess.run([str(peekaboo), "set-value", "--help"], capture_output=True, text=True, timeout=10)
-    if help_result.returncode != 0:
-        raise BridgeError("peekaboo_too_old", "Installed Peekaboo lacks set-value; refusing keyboard-based fallback.")
-
-    seen = _run_json(
-        [
-            str(peekaboo), "see", "--app", "LINE", "--timeout-seconds", "15", "--no-web-focus", "--json", "--no-remote",
-        ],
-        timeout=25,
-    )
-    data = seen.get("data", {})
-    snapshot = data.get("snapshot_id") or data.get("snapshotId")
-    elements = data.get("ui_elements") or data.get("uiElements") or []
-    text_fields = []
-    for element in elements:
-        role = str(element.get("role") or element.get("role_description") or "")
-        frame = element.get("frame") or element.get("bounds") or {}
-        x = float(frame.get("x", 10_000))
-        y = float(frame.get("y", 10_000))
-        if "TextField" in role and x < 700 and y < 450 and element.get("id"):
-            text_fields.append(element)
-    if not snapshot or len(text_fields) != 1:
-        raise BridgeError(
-            "safe_search_field_unavailable",
-            "Could not uniquely identify LINE's top-left search field; refusing to use keyboard or guess.",
-            candidateCount=len(text_fields),
-        )
-    field_id = str(text_fields[0]["id"])
-    _run_json(
-        [str(peekaboo), "set-value", chat["name"], "--on", field_id, "--snapshot", str(snapshot), "--json", "--no-remote"]
-    )
-    time.sleep(1.0)
-    results = _run_json(
-        [
-            str(peekaboo), "see", "--app", "LINE", "--timeout-seconds", "15", "--no-web-focus", "--json", "--no-remote",
-        ],
-        timeout=25,
-    )
-    result_data = results.get("data", {})
-    result_snapshot = result_data.get("snapshot_id") or result_data.get("snapshotId")
-    result_elements = result_data.get("ui_elements") or result_data.get("uiElements") or []
-    exact = []
-    for element in result_elements:
-        labels = [element.get(key) for key in ("label", "title", "value", "name")]
-        if chat["name"] in labels and element.get("id"):
-            exact.append(element)
-    if not result_snapshot or len(exact) != 1:
-        raise BridgeError(
-            "safe_chat_result_unavailable",
-            "Could not identify one exact search result; no click or scroll was attempted.",
-            candidateCount=len(exact),
-        )
-    _run_json(
-        [str(peekaboo), "click", "--on", str(exact[0]["id"]), "--snapshot", str(result_snapshot), "--app", "LINE", "--json", "--no-remote"]
-    )
-    time.sleep(0.8)
-    for _round in range(rounds):
-        _run_json(
-            [str(peekaboo), "scroll", "--direction", "up", "--amount", "12", "--app", "LINE", "--json", "--no-remote"],
-            timeout=45,
-        )
-        time.sleep(1.2)
+    if graphical_session_available() is not True:
+        raise BridgeError("history_ui_session_unavailable", "History loading requires a confirmed unlocked graphical session; local reads remain available.")
+    ui_result = run_history_helper(chat["name"], rounds)
     with open_database() as (connection, _db, _meta):
         after = coverage(connection, chat["chatId"])
     return {
@@ -1292,7 +1709,10 @@ def sync_older_operation(args: dict[str, Any]) -> dict[str, Any]:
         "before": before,
         "after": after,
         "newMessages": max(0, after["localMessageCount"] - before["localMessageCount"]),
-        "safety": {"typed": False, "pasted": False, "keyboardInput": False, "composerFocused": False, "sent": False},
+        "ui": ui_result,
+        "olderHistoryAdvanced": after["oldestLocalMessage"] != before["oldestLocalMessage"],
+        "syncComplete": None,
+        "safety": {"typed": False, "pasted": False, "keyboardInput": False, "composerInputUsed": False, "sent": False},
     }
 
 
@@ -1354,6 +1774,10 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
         return list_chats_operation(args)
     if operation == "read_history":
         return read_history_operation(args)
+    if operation == "get_attachment_info":
+        return get_attachment_info_operation(args)
+    if operation == "download_attachment":
+        return download_attachment_operation(args)
     if operation == "refresh_latest":
         return refresh_latest_operation(args)
     if operation == "get_relationship_context":
