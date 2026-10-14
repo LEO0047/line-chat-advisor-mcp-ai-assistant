@@ -16,6 +16,8 @@ builds private relationship context, and suggests whether and how to reply.
 > by LINE Corporation or OpenAI. Use only with your own account and data, and
 > review the relevant product terms before use.
 
+> 套件安裝與限制：[INSTALL.md](INSTALL.md) · 維護與發布：[MAINTAINERS.md](MAINTAINERS.md)。npm 發布與外部採用尚未完成。
+
 ## English
 
 ### What this project does
@@ -51,7 +53,7 @@ Reply text is displayed in ChatGPT/Codex only.
 - Login Keychain-only database key retrieval
 - Exact display-name or `chatId` resolution; ambiguous names fail closed
 - Bounded history reads with stable timestamp/message-ID cursor pagination
-- Target-specific latest-message refresh using DB evidence
+- Target-specific local snapshot refresh; server completeness remains unverified
 - First-full-then-incremental local relationship context
 - Optimistic context versions to prevent stale task overwrites
 - A global `line-chat-advisor` Codex skill
@@ -60,10 +62,12 @@ Reply text is displayed in ChatGPT/Codex only.
 
 ### Safety architecture
 
-The MCP exposes exactly eight operations:
+The MCP exposes exactly ten operations:
 
 | Tool | Purpose | Writes LINE source DB? |
 | --- | --- | --- |
+| `get_attachment_info` | Read bounded attachment metadata without keys | No |
+| `download_attachment` | Fetch from fixed LINE OBS host, verify and save under Downloads | No |
 | `line_status` | Verify DB discovery, Keychain access, decryption, and snapshot state | No |
 | `list_chats` | List recent exact chat candidates | No |
 | `read_history` | Read bounded history and deduplicate it into private local memory | No |
@@ -97,12 +101,27 @@ git clone https://github.com/LEO0047/line-chat-advisor-mcp-ai-assistant.git
 cd line-chat-advisor-mcp-ai-assistant
 scripts/bootstrap
 scripts/build-peekaboo
+scripts/build-history-helper
 ```
 
 `scripts/bootstrap` clones the three commits in [VENDOR_LOCK.md](VENDOR_LOCK.md)
 without executing vendor code, installs hash-pinned Python and lockfile-pinned
 Node dependencies, and runs the tests. `scripts/build-peekaboo` separately
 builds only the reviewed Peekaboo commit into the ignored `runtime/` directory.
+
+`scripts/build-history-helper` builds the project's bounded native AX adapter.
+Historical backfill requires an already-open, focused chat with an exact window
+title and one identifiable message list. It sends wheel events only to LINE;
+it does not search, click results, read message text from UI, or use keys.
+If LINE omits the accessible message list, the operation stops explicitly.
+The Codex computer tool can open/scroll an exact chat when available; actual
+text must still be read through `read_history`. Verify the oldest message and
+count after loading, not just a successful scroll. Server completeness remains
+unknown without an authoritative acknowledgement.
+
+For window-read timeouts, use the bounded diagnostic and recovery procedure in
+[Historical UI troubleshooting](HISTORY-UI-TROUBLESHOOTING.md). Keep window
+recovery, actual scrolling, and verified new history as separate results.
 
 Register the MCP in `~/.codex/config.toml`, replacing the placeholder with the
 absolute clone path:
@@ -164,9 +183,24 @@ line_status → refresh_latest → get_relationship_context → read_history
             → save_relationship_context
 ```
 
-If freshness cannot be proven, it stops instead of presenting stale content as
-current. If a reply is needed, it returns only one sentence. Otherwise it
-returns `現在不用回。`
+`ok: true` and `localSnapshotRefreshed: true` permit reading the refreshed local
+snapshot. While locked, the bridge polls passively for the requested window or
+until the target advances, without UI actions. `targetAdvanced` only records
+local message progress, which may be outgoing. Neither app activation nor local
+changes prove server completeness: `freshnessVerified` is now always false,
+with `syncComplete: null` and `serverWatermark: null` until an authoritative
+server acknowledgement is available. Consumers of the older freshness flag
+must use `localSnapshotRefreshed` for local-read success instead.
+
+Results report snapshot time, latest target-message time, and unverified server
+sync. DB/key/snapshot failures still stop the read. Date-range requests return
+transcripts; reply-advice requests return a short suggestion when appropriate.
+
+The documented [LINE Messaging API](https://developers.line.biz/en/docs/messaging-api/receiving-messages/)
+receives messages for Official Accounts through webhooks; it is not a private
+Desktop-chat synchronization acknowledgement or backfill interface for this
+bridge. Its documentation also says received text cannot be fetched again by
+API. No server completeness guarantee is implemented here.
 
 ### Repository contents
 
@@ -241,8 +275,11 @@ line_status → refresh_latest → get_relationship_context → read_history
             → save_relationship_context
 ```
 
-`refresh_latest` 只有在目標聊天室的 timestamp/message ID 前進時才成功；若無法
-證明資料已刷新，skill 會停止，不會拿舊訊息假裝最新。`read_history` 與
+`refresh_latest` 以 `localSnapshotRefreshed` 表示已取得本機穩定唯讀快照；
+鎖屏時會持續被動檢查至指定期限或目標前進。`targetAdvanced` 僅表示本機目標
+紀錄前進，不能證明伺服器同步完整；`freshnessVerified` 保持 false，
+`syncComplete` 與 `serverWatermark` 保持 null。輸出會附讀取時間與同步未確認提示，
+不因鎖屏阻擋本機讀取；DB／金鑰／快照失敗仍停止。`read_history` 與
 `save_relationship_context` 只會寫入被 Git 忽略、權限為 `0600` 的本機記憶，
 永遠不會修改 LINE 來源 DB。
 

@@ -4,12 +4,20 @@ set -euo pipefail
 project_root=${0:A:h:h}
 cd "$project_root"
 
+# Fail before downloads on unsupported hosts. Only this wheel is hash-pinned.
+if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
+  print -u2 -- 'Supported runtime: Apple Silicon macOS only.'
+  exit 1
+fi
+python_bin=${LINE_RELAY_PYTHON:-/opt/homebrew/bin/python3.14}
+"$python_bin" -c 'import sys; assert sys.version_info[:2] == (3, 14), "Python 3.14 required"'
 "$project_root/scripts/bootstrap-vendors"
 
 if [[ ! -d .venv ]]; then
-  /opt/homebrew/bin/python3 -m venv .venv
+  "$python_bin" -m venv .venv
 fi
 
 .venv/bin/python3 -m pip install --disable-pip-version-check --require-hashes -r requirements.lock
+.venv/bin/python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r requirements-attachments.lock
 npm ci --ignore-scripts --no-audit --no-fund
 npm run test

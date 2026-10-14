@@ -23,6 +23,24 @@ def digest(path: Path) -> str:
 
 
 class BridgeTests(unittest.TestCase):
+    def test_attachment_info_scopes_chat_and_redacts_secrets(self):
+        c = sqlite3.connect(":memory:")
+        self.addCleanup(c.close)
+        c.execute("CREATE TABLE _message (_chatId TEXT,_id TEXT,_createdTime INTEGER,_text TEXT,_contentType INTEGER,_contentMetadata TEXT)")
+        c.execute("INSERT INTO _message VALUES (?,?,?,?,?,?)", ("chat-a", "m1", 1000, "sample.pdf", 14,
+                  json.dumps({"FILE_SIZE": "42", "OID": "secret", "keyMaterial": "secret"})))
+        result = bridge.attachment_info(c, "chat-a", "m1")
+        self.assertEqual(result["expectedBytes"], 42)
+        self.assertFalse(result["downloaded"])
+        self.assertNotIn("secret", json.dumps(result))
+        with self.assertRaises(bridge.BridgeError):
+            bridge.attachment_info(c, "chat-b", "m1")
+        c.execute("UPDATE _message SET _contentMetadata='not json'")
+        self.assertIsNone(bridge.attachment_info(c, "chat-a", "m1")["expectedBytes"])
+        c.execute("UPDATE _message SET _contentType=0")
+        with self.assertRaises(bridge.BridgeError):
+            bridge.attachment_info(c, "chat-a", "m1")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -628,6 +646,11 @@ class BridgeTests(unittest.TestCase):
             result = bridge.refresh_latest_operation({"chat": "Exact", "timeoutSeconds": 30})
         self.assertTrue(result["ok"])
         self.assertTrue(result["targetAdvanced"])
+        self.assertFalse(result["freshnessVerified"])
+        self.assertTrue(result["localSnapshotRefreshed"])
+        self.assertIsNone(result["syncComplete"])
+        self.assertIsNone(result["serverWatermark"])
+        self.assertEqual(result["freshnessMode"], "target_advanced")
         self.assertEqual(result["strategy"], "passive")
         focus.assert_not_called()
         launch.assert_not_called()
@@ -650,6 +673,8 @@ class BridgeTests(unittest.TestCase):
             result = bridge.refresh_latest_operation({"chat": "Exact", "timeoutSeconds": 30})
         self.assertEqual(result["strategy"], "focus")
         self.assertTrue(result["targetAdvanced"])
+        self.assertFalse(result["freshnessVerified"])
+        self.assertIsNone(result["syncComplete"])
         focus.assert_called_once()
         launch.assert_not_called()
 
@@ -670,6 +695,8 @@ class BridgeTests(unittest.TestCase):
         ):
             result = bridge.refresh_latest_operation({"chat": "Exact"})
         self.assertEqual(result["strategy"], "launch")
+        self.assertFalse(result["freshnessVerified"])
+        self.assertTrue(result["localSnapshotRefreshed"])
         launch.assert_called_once()
         focus.assert_not_called()
 
@@ -679,7 +706,7 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(bridge.target_advanced(before, after))
         self.assertFalse(bridge.target_advanced(after, before))
 
-    def test_other_chat_global_update_does_not_advance_target(self):
+    def test_activation_and_unrelated_messages_do_not_prove_sync_complete(self):
         chat = {"chatId": "u1", "name": "Exact", "isGroup": False}
         before = self.refresh_state(100, "m1")
         patches = self.refresh_mocks(running=True)
@@ -693,17 +720,19 @@ class BridgeTests(unittest.TestCase):
                 (False, before, 12, (("db", (3, 4, 5)),)),
             ],
         ):
-            with self.assertRaises(bridge.BridgeError) as caught:
-                bridge.refresh_latest_operation({"chat": "Exact", "timeoutSeconds": 5})
-        payload = caught.exception.payload()
-        self.assertEqual(payload["error"], "target_not_advanced")
-        self.assertFalse(payload["targetAdvanced"])
-        self.assertEqual(payload["globalMessageCountAfter"], 12)
-        self.assertEqual(payload["safety"], bridge.refresh_safety())
+            result = bridge.refresh_latest_operation({"chat": "Exact", "timeoutSeconds": 5})
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["targetAdvanced"])
+        self.assertFalse(result["freshnessVerified"])
+        self.assertIsNone(result["syncComplete"])
+        self.assertIsNone(result["serverWatermark"])
+        self.assertEqual(result["freshnessMode"], "stable_after_line_activation")
+        self.assertEqual(result["globalMessageCountAfter"], 12)
+        self.assertEqual(result["safety"], bridge.refresh_safety())
         focus.assert_called_once()
         launch.assert_not_called()
 
-    def test_locked_session_fails_before_any_ui_action(self):
+    def test_locked_session_reads_local_snapshot_through_full_deadline_without_ui(self):
         chat = {"chatId": "u1", "name": "Exact", "isGroup": False}
         before = self.refresh_state(100, "m1")
         patches = self.refresh_mocks(session=False)
@@ -713,10 +742,52 @@ class BridgeTests(unittest.TestCase):
             bridge,
             "poll_target_advance",
             return_value=(False, before, 10, (("db", (1, 2, 3)),)),
-        ):
+        ) as poll, mock.patch.object(bridge.time, "monotonic", return_value=100.0):
+            result = bridge.refresh_latest_operation({"chat": "Exact", "timeoutSeconds": 30})
+        self.assertEqual(poll.call_count, 2)
+        self.assertEqual(poll.call_args_list[0].args[3], 105.0)
+        self.assertEqual(poll.call_args_list[1].args[3], 130.0)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["localSnapshotRefreshed"])
+        self.assertFalse(result["freshnessVerified"])
+        self.assertFalse(result["targetAdvanced"])
+        self.assertIsNone(result["syncComplete"])
+        self.assertEqual(result["activationSkipped"], "locked_session")
+        self.assertEqual(result["freshnessMode"], "local_snapshot")
+        focus.assert_not_called()
+        launch.assert_not_called()
+
+    def test_locked_session_detects_target_update_after_initial_passive_window(self):
+        chat = {"chatId": "u1", "name": "Exact", "isGroup": False}
+        before = self.refresh_state(100, "m1")
+        after = self.refresh_state(102, "m2", 2)
+        patches = self.refresh_mocks(session=False)
+        with patches[0], patches[1], patches[2], patches[3] as focus, patches[4] as launch, mock.patch.object(
+            bridge, "read_refresh_snapshot", return_value=(chat, before, 10, ())
+        ), mock.patch.object(bridge, "poll_target_advance", side_effect=[
+            (False, before, 10, ()), (True, after, 11, ()),
+        ]):
+            result = bridge.refresh_latest_operation({"chat": "Exact"})
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["targetAdvanced"])
+        self.assertEqual(result["after"]["latestMessageId"], "m2")
+        self.assertFalse(result["freshnessVerified"])
+        self.assertIsNone(result["syncComplete"])
+        focus.assert_not_called()
+        launch.assert_not_called()
+
+    def test_locked_session_final_snapshot_failure_is_not_local_success(self):
+        chat = {"chatId": "u1", "name": "Exact", "isGroup": False}
+        before = self.refresh_state(100, "m1")
+        patches = self.refresh_mocks(session=False)
+        with patches[0], patches[1], patches[2], patches[3] as focus, patches[4] as launch, mock.patch.object(
+            bridge, "read_refresh_snapshot", return_value=(chat, before, 10, ())
+        ), mock.patch.object(bridge, "poll_target_advance", side_effect=[
+            (False, before, 10, ()), bridge.BridgeError("snapshot_unstable", "test failure"),
+        ]):
             with self.assertRaises(bridge.BridgeError) as caught:
                 bridge.refresh_latest_operation({"chat": "Exact"})
-        self.assertEqual(caught.exception.code, "locked_session_unavailable")
+        self.assertEqual(caught.exception.code, "snapshot_unstable")
         focus.assert_not_called()
         launch.assert_not_called()
 
@@ -748,12 +819,156 @@ class BridgeTests(unittest.TestCase):
         for command in (focus_command, launch_command):
             self.assertTrue(forbidden.isdisjoint({token.lower() for token in command}))
 
+    def test_run_json_returns_only_redacted_peekaboo_failure_details(self):
+        failed = subprocess.CompletedProcess(
+            args=["peekaboo", "see"],
+            returncode=1,
+            stdout=json.dumps({"success": False, "error": {"code": "WINDOW_NOT_FOUND", "message": "private"}}),
+            stderr="private stderr",
+        )
+        with mock.patch.object(bridge.subprocess, "run", return_value=failed), self.assertRaises(
+            bridge.BridgeError
+        ) as caught:
+            bridge._run_json(["peekaboo", "see"], stage="inspect_line")
+        self.assertEqual(caught.exception.code, "peekaboo_failed")
+        self.assertEqual(
+            caught.exception.extra,
+            {
+                "stage": "inspect_line",
+                "peekabooCode": "WINDOW_NOT_FOUND",
+                "failedCommand": None,
+                "failureReason": "unclassified",
+            },
+        )
+        self.assertNotIn("private", json.dumps(caught.exception.payload()))
+
+    def test_safe_search_field_accepts_current_and_legacy_peekaboo_roles(self):
+        base = {"id": "field", "bounds": {"x": 20, "y": 30, "width": 200, "height": 24}}
+        self.assertTrue(bridge.is_safe_search_field_candidate({**base, "role": "textField"}))
+        self.assertTrue(bridge.is_safe_search_field_candidate({**base, "role": "AXTextField"}))
+        self.assertTrue(bridge.is_safe_search_field_candidate({**base, "role": "searchField"}))
+        self.assertFalse(bridge.is_safe_search_field_candidate({**base, "role": "button"}))
+        self.assertFalse(
+            bridge.is_safe_search_field_candidate(
+                {**base, "role": "textField", "bounds": {"x": 900, "y": 30, "width": 200, "height": 24}}
+            )
+        )
+
+    def test_exact_chat_static_text_resolves_to_smallest_actionable_container(self):
+        elements = [
+            {
+                "id": "label",
+                "label": "Exact",
+                "is_actionable": False,
+                "bounds": {"x": 30, "y": 40, "width": 80, "height": 20},
+            },
+            {
+                "id": "row",
+                "role": "group",
+                "is_actionable": True,
+                "bounds": {"x": 20, "y": 30, "width": 200, "height": 50},
+            },
+            {
+                "id": "list",
+                "role": "group",
+                "is_actionable": True,
+                "bounds": {"x": 0, "y": 0, "width": 500, "height": 500},
+            },
+        ]
+        target = bridge.resolve_exact_chat_click_target(elements, "Exact")
+        self.assertEqual(target["id"], "row")
+
+    def test_history_backfill_does_not_reuse_snapshots_or_click_results(self):
+        before = {"localMessageCount": 2, "oldestLocalMessage": "2026-08-15", "newestLocalMessage": "2026-09-01"}
+        after = {**before, "localMessageCount": 3, "newestLocalMessage": "2026-10-11"}
+        db_context = contextlib.nullcontext((object(), None, {}))
+        with mock.patch.object(bridge, "open_database", return_value=db_context), mock.patch.object(
+            bridge, "resolve_chat", return_value={"chatId": "chat-a", "name": "Exact"}
+        ), mock.patch.object(bridge, "coverage", side_effect=[before, after]), mock.patch.object(
+            bridge, "line_running", return_value=True
+        ), mock.patch.object(bridge, "graphical_session_available", return_value=True), mock.patch.object(
+            bridge, "run_history_helper", return_value={"historyPaneVerified": True}
+        ) as load, mock.patch.object(bridge, "_run_json", side_effect=AssertionError("No snapshot UI")), mock.patch.object(
+            bridge, "focus_line_window", side_effect=AssertionError("No activation")
+        ):
+            result = bridge.sync_older_operation({"chat": "chat-a", "rounds": 1})
+        load.assert_called_once_with("Exact", 1)
+        self.assertFalse(result["olderHistoryAdvanced"])
+        self.assertEqual(result["newMessages"], 1)
+        self.assertIsNone(result["syncComplete"])
+
+    def test_history_backfill_rejects_locked_session_before_ui(self):
+        with mock.patch.object(bridge, "open_database", return_value=contextlib.nullcontext((object(), None, {}))), mock.patch.object(
+            bridge, "resolve_chat", return_value={"chatId": "chat-a", "name": "Exact"}
+        ), mock.patch.object(bridge, "coverage", return_value={}), mock.patch.object(
+            bridge, "line_running", return_value=True
+        ), mock.patch.object(bridge, "graphical_session_available", return_value=False), mock.patch.object(
+            bridge, "run_history_helper"
+        ) as load, self.assertRaises(bridge.BridgeError) as caught:
+            bridge.sync_older_operation({"chat": "chat-a", "rounds": 1})
+        self.assertEqual(caught.exception.code, "history_ui_session_unavailable")
+        load.assert_not_called()
+
     def test_peekaboo_timeout_is_explicit_and_does_not_fallback(self):
         with mock.patch.object(bridge.subprocess, "run", side_effect=subprocess.TimeoutExpired(["peekaboo"], 5)):
             with self.assertRaises(bridge.BridgeError) as caught:
                 bridge._run_json(["peekaboo", "see"], timeout=5)
         self.assertEqual(caught.exception.code, "peekaboo_timeout")
         self.assertIn("no fallback input", caught.exception.detail)
+
+    def test_native_history_adapter_bounds_timeout_and_redacts_output(self):
+        helper = self.root / "line-history-accessibility"
+        helper.write_bytes(b"binary")
+        with mock.patch.object(bridge, "history_helper_path", return_value=helper), mock.patch.object(
+            bridge.subprocess, "run", side_effect=subprocess.TimeoutExpired([str(helper)], 20)
+        ) as run, self.assertRaises(bridge.BridgeError) as caught:
+            bridge.run_history_helper("Exact", 1)
+        self.assertEqual(caught.exception.code, "history_ui_timeout")
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+        self.assertEqual(run.call_args.args[0], [str(helper), "load", "Exact", "1"])
+
+    def test_native_history_adapter_rejects_unverified_chat_and_rounds(self):
+        helper = self.root / "line-history-accessibility"
+        helper.write_bytes(b"binary")
+        result = subprocess.CompletedProcess([], 0, json.dumps({"ok": True, "openedExactResult": True,
+                  "completedRounds": 1, "historyPaneVerified": False, "private": "not exposed"}), "private stderr")
+        with mock.patch.object(bridge, "history_helper_path", return_value=helper), mock.patch.object(
+            bridge.subprocess, "run", return_value=result
+        ), self.assertRaises(bridge.BridgeError) as caught:
+            bridge.run_history_helper("Exact", 1)
+        self.assertEqual(caught.exception.code, "history_ui_unverified")
+        self.assertNotIn("private", json.dumps(caught.exception.payload()))
+
+    def test_native_history_identity_failure_reports_only_boolean_checks(self):
+        helper = self.root / "line-history-accessibility"
+        helper.write_bytes(b"binary")
+        result = subprocess.CompletedProcess([], 1, json.dumps({
+            "ok": False, "error": "opened_chat_identity_unverified",
+            "windowTitleMatches": False, "lineFrontmost": True,
+            "windowTitle": "private title", "private": "private content",
+        }), "private stderr")
+        with mock.patch.object(bridge, "history_helper_path", return_value=helper), mock.patch.object(
+            bridge.subprocess, "run", return_value=result
+        ), self.assertRaises(bridge.BridgeError) as caught:
+            bridge.run_history_helper("Exact", 1)
+        payload = caught.exception.payload()
+        self.assertEqual(payload["identityChecks"], {
+            "windowTitleMatches": False, "lineFrontmost": True,
+        })
+        self.assertNotIn("private", json.dumps(payload))
+
+    def test_native_history_identity_checks_reject_non_boolean_values(self):
+        helper = self.root / "line-history-accessibility"
+        helper.write_bytes(b"binary")
+        result = subprocess.CompletedProcess([], 1, json.dumps({
+            "ok": False, "error": "opened_chat_identity_unverified",
+            "windowTitleMatches": "private title", "lineFrontmost": 1,
+        }), "")
+        with mock.patch.object(bridge, "history_helper_path", return_value=helper), mock.patch.object(
+            bridge.subprocess, "run", return_value=result
+        ), self.assertRaises(bridge.BridgeError) as caught:
+            bridge.run_history_helper("Exact", 1)
+        self.assertNotIn("identityChecks", caught.exception.payload())
 
 
 if __name__ == "__main__":

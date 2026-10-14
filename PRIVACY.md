@@ -48,3 +48,10 @@ home-directory username, account token, or machine-specific snapshot remains.
 所有 LINE DB/WAL/SHM、Keychain 金鑰、暫存快照、聊天記憶、聯絡人名稱、chatId、
 訊息與偵錯輸出都必須留在本機。建議回覆只顯示於 ChatGPT/Codex，本專案永遠
 不傳送至 LINE。
+
+## Attachment requests
+
+Explicit attachment download requests send the message reference and current LINE OBS
+credential to obs.line-apps.com. They do not send conversation contents to another
+service. The downloaded original is saved under the user's Downloads directory, outside
+the repository; it must not be committed or included in a release.
