@@ -16,7 +16,7 @@ builds private relationship context, and suggests whether and how to reply.
 > by LINE Corporation or OpenAI. Use only with your own account and data, and
 > review the relevant product terms before use.
 
-> 套件安裝與限制：[INSTALL.md](INSTALL.md) · 維護與發布：[MAINTAINERS.md](MAINTAINERS.md)。npm 發布與外部採用尚未完成。
+> **Published / 已發布：** [line-context-relay@0.2.0](https://www.npmjs.com/package/line-context-relay)，2026-10-14 17:53（Asia/Taipei）。正式安裝與限制：[INSTALL.md](INSTALL.md) · 維護：[MAINTAINERS.md](MAINTAINERS.md)。發布不代表已證實外部採用、第三方安全認證或完整相容性驗證。
 
 ## English
 
@@ -83,11 +83,13 @@ and [AUDIT.md](AUDIT.md) for the detailed boundary.
 
 ### Requirements
 
-- macOS with LINE Desktop installed and signed in
-- ChatGPT desktop with Codex/MCP support
-- Node.js 20 or later
+- Apple Silicon macOS with LINE Desktop installed and signed in; Intel Mac,
+  Windows and Linux are unsupported by this package
+- A client supporting local stdio MCP, such as Codex
+- Node.js 20 or later and npm (declared range; stable Node 20/22 remain unverified)
 - Homebrew Python 3.14 compatible with the pinned `apsw-sqlite3mc` wheel
-- Xcode Command Line Tools, Swift, LLDB, and Git
+- Xcode toolchain with Swift/LLDB, Git and zsh; the complete toolchain/minimum
+  macOS combination needed by the pinned Peekaboo build remains unverified
 - macOS Login Keychain access
 - Accessibility permission for the pinned local Peekaboo build; Screen Recording
   may also be requested by Peekaboo even though ordinary chat text comes from
@@ -96,13 +98,35 @@ and [AUDIT.md](AUDIT.md) for the detailed boundary.
 
 ### Installation
 
-```bash
-git clone https://github.com/LEO0047/line-chat-advisor-mcp-ai-assistant.git
-cd line-chat-advisor-mcp-ai-assistant
+Start with the published npm tarball in a persistent private directory:
+
+```sh
+(
+  set -eu
+  umask 077
+  mkdir -m 700 "$HOME/line-context-relay-0.2.0"
+  cd "$HOME/line-context-relay-0.2.0"
+  npm pack line-context-relay@0.2.0 --ignore-scripts --registry=https://registry.npmjs.org
+  tar -xzf line-context-relay-0.2.0.tgz
+)
+```
+
+If the directory already exists, stop and choose a new private directory.
+Then run each setup step from the extracted package root, stopping on errors:
+
+```sh
+cd "$HOME/line-context-relay-0.2.0/package"
 scripts/bootstrap
+node bin/line-context-relay.mjs --help
 scripts/build-peekaboo
 scripts/build-history-helper
 ```
+
+There are no install/postinstall hooks. Downloading the package does not set up
+dependencies, permissions or Keychain. Avoid global installation or temporary
+`npx` execution: this version stores its Python environment and private state
+under the installation root. See [INSTALL.md](INSTALL.md) for prerequisites,
+release integrity evidence, alternate Python paths and pinned-source installation.
 
 `scripts/bootstrap` clones the three commits in [VENDOR_LOCK.md](VENDOR_LOCK.md)
 without executing vendor code, installs hash-pinned Python and lockfile-pinned
@@ -123,16 +147,17 @@ For window-read timeouts, use the bounded diagnostic and recovery procedure in
 [Historical UI troubleshooting](HISTORY-UI-TROUBLESHOOTING.md). Keep window
 recovery, actual scrolling, and verified new history as separate results.
 
-Register the MCP in `~/.codex/config.toml`, replacing the placeholder with the
-absolute clone path:
+Complete the one-time Keychain setup below, then register the MCP in
+`~/.codex/config.toml`. Use `node -p 'process.execPath'` to find Node and `pwd`
+from the package root to find the installation path; replace both placeholders:
 
 ```toml
 [mcp_servers.line-readonly]
-command = "/opt/homebrew/bin/node"
-args = ["<absolute-project-path>/src/line-readonly-mcp/server.mjs"]
+command = "/absolute/path/to/node"
+args = ["/absolute/path/to/line-context-relay-0.2.0/package/bin/line-context-relay.mjs"]
 ```
 
-Install the global skill without copying private state:
+Install the global skill from the package root without copying private state:
 
 ```bash
 mkdir -p "$HOME/.codex/skills"
@@ -141,6 +166,21 @@ ln -s "$(pwd)/skills/line-chat-advisor" "$HOME/.codex/skills/line-chat-advisor"
 
 Do not overwrite an existing skill path without reviewing it. Restart/reload
 ChatGPT/Codex after changing MCP or skill configuration.
+
+### Release verification limits
+
+The published tarball contains 38 files matching PR #2's merged source; see
+[INSTALL.md](INSTALL.md) for hashes, commit IDs and the verification boundary.
+PR #2 reported 7 Node and 55 Python tests using Node 26.8.0-alpha and Python
+3.14 on Apple Silicon macOS. Stable Node 20/22, a new user's complete setup,
+live attachment retrieval, native history UI behavior and the Peekaboo build
+were not verified in that PR. The completed Codex Security Review is not a
+third-party certification. [ACCEPTANCE.md](ACCEPTANCE.md) contains older local
+observations, not a complete acceptance record for 0.2.0.
+
+These GitHub documentation updates do not change the README/INSTALL already
+inside the published 0.2.0 tarball; follow the current
+[GitHub installation guide](https://github.com/LEO0047/line-chat-advisor-mcp-ai-assistant/blob/master/INSTALL.md).
 
 ### One-time key capture
 
@@ -259,7 +299,7 @@ Mac 仍需開機、連網，且已登入可用的圖形工作階段。
 - 解密金鑰只從 macOS Login Keychain 取得
 - 精確名稱／`chatId` 解析，重名就停止而不是猜測
 - 有上限的歷史讀取與 timestamp/message-ID cursor 分頁
-- 以目標聊天室 DB 前進證據判定最新同步
+- 重新建立目標聊天室的本機穩定快照；DB 紀錄前進不代表伺服器同步完整
 - 第一次完整讀取，之後依 cursor 增量更新關係脈絡
 - context version 防止不同 Codex task 互相覆蓋新版摘要
 - 全域 `line-chat-advisor` skill
@@ -285,26 +325,39 @@ line_status → refresh_latest → get_relationship_context → read_history
 
 ### 安裝
 
-```bash
-git clone https://github.com/LEO0047/line-chat-advisor-mcp-ai-assistant.git
-cd line-chat-advisor-mcp-ai-assistant
+正式版本為 **`line-context-relay@0.2.0`**。先依
+[INSTALL.md](INSTALL.md) 的前置條件與第 1 步，從 npm 下載固定版本並解壓到私人目錄。
+僅限 Apple Silicon macOS、Python 3.14；Node 宣告 `>=20`，但穩定版 Node 20／22
+仍未驗證。全新使用者的 Keychain／權限流程、實際附件下載、原生歷史 UI 與該 PR
+的 Peekaboo 編譯流程也尚未驗證；已發布不等於全面驗收或第三方安全認證。
+
+在解壓後的套件根目錄逐項執行，失敗就先停止排錯：
+
+```sh
+cd "$HOME/line-context-relay-0.2.0/package"
 scripts/bootstrap
+node bin/line-context-relay.mjs --help
 scripts/build-peekaboo
+scripts/build-history-helper
 ```
+
+下載套件不會自動初始化、取得金鑰或註冊 MCP。因私人狀態與 `.venv` 位於安裝目錄，
+不建議全域安裝或以 `npx` 暫存啟動。固定原始碼安裝方式也列於 INSTALL.md。
 
 `scripts/bootstrap` 會依 [VENDOR_LOCK.md](VENDOR_LOCK.md) 下載三個經審查的固定
 commit，不執行 vendor 程式，接著安裝 lockfile／hash 鎖定依賴並跑測試。
 Peekaboo 必須用獨立指令明確建置，產物只放在被忽略的 `runtime/`。
 
-在 `~/.codex/config.toml` 註冊 MCP：
+完成下方的一次性 Keychain 設定後，在 `~/.codex/config.toml` 註冊 MCP。
+以 `node -p 'process.execPath'` 取得 Node 路徑、`pwd` 取得套件根目錄，替換以下佔位符：
 
 ```toml
 [mcp_servers.line-readonly]
-command = "/opt/homebrew/bin/node"
-args = ["<專案絕對路徑>/src/line-readonly-mcp/server.mjs"]
+command = "/absolute/path/to/node"
+args = ["/absolute/path/to/line-context-relay-0.2.0/package/bin/line-context-relay.mjs"]
 ```
 
-安裝全域 skill：
+在套件根目錄安裝全域 skill（不要覆蓋既有同名路徑）：
 
 ```bash
 mkdir -p "$HOME/.codex/skills"
